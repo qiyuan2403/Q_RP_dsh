@@ -20,28 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The harness depends on the kernel repository. CI checks it out into a
-      # subdirectory and points a workspace file at it, so the kernel revision
-      # under test is the current one rather than a released version.
-      - name: Check out the kernel
-        uses: actions/checkout@v4
-        with:
-          repository: qiyuan2403/Y_Cordis
-          path: _kernel
-
-      - name: Point the workspace at the checked-out kernel
-        shell: bash
-        run: |
-          cat > go.work <<'WORK'
-          go 1.27.1
-
-          use (
-          	.
-          	./_kernel
-          )
-          WORK
-          cat go.work
-
+      # The kernel is a released module (github.com/qiyuan2403/Y_Cordis), so no
+      # sibling checkout is needed: `go test` fetches the version go.mod pins.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
