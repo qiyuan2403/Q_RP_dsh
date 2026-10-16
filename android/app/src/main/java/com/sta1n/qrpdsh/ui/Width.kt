@@ -67,6 +67,38 @@ object Width {
     /** Sidebar auto-collapse rule (stores.ts narrowExpanded). */
     fun sidebarAutoCollapse(viewport: Int): Boolean = viewport < SIDEBAR_AUTO_COLLAPSE
 
+    // ------------------------------------------------------------------
+    // Drag feel (ConversationWidthControls.tsx, ported exactly — the feel
+    // IS the code: no inertia, no animation, frame-coalesced, symmetric x2).
+    // ------------------------------------------------------------------
+
+    /**
+     * outwardWidth: a drag's width delta is the pointer dx TIMES TWO — both
+     * handles are symmetric, so pulling one side outward widens the column
+     * on both sides at once. Left handle: dx negated before the multiply.
+     */
+    fun draggedWidth(baseWidth: Int, originX: Float, latestX: Float, leftHandle: Boolean): Int {
+        val dx = latestX - originX
+        val outward = if (leftHandle) -dx else dx
+        return (baseWidth + outward * 2).toInt()
+    }
+
+    /**
+     * Whether a width handle renders at all: the strip is
+     * width = min(10px, (column - content)/2 - 48) and a non-positive
+     * result means no handle (ConversationRoot.module.css .widthHandle).
+     */
+    fun handleVisible(columnWidth: Int, contentWidth: Int): Boolean =
+        (columnWidth - contentWidth) / 2 - 48 > 0
+
+    /** The 10px strip cap on the same formula. */
+    fun handleWidthPx(columnWidth: Int, contentWidth: Int): Int =
+        minOf(10, (columnWidth - contentWidth) / 2 - 48)
+
+    // The persistence key and commit semantics: a pure tap (origin == latest)
+    // must NOT overwrite the stored preference (onCommit guard).
+    const val WIDTH_PREF_KEY = "dsh.conversation.contentWidth"
+
     // ---- Composer clearances (ConversationRoot.module.css .body) ----
     val composerSideClearance: Dp = 16.dp
     /** .scroll: 16px calc(clearance+16px) per side. */

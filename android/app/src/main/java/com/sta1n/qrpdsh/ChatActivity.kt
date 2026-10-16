@@ -8,7 +8,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -48,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -241,22 +245,42 @@ class ChatActivity : ComponentActivity() {
 
     // ------------------------------------------------------------------ UI
 
+    // The user's dragged width preference, persisted like the official
+    // client's localStorage key. Null = follow the default solver.
+    private var widthPref by mutableStateOf<Int?>(null)
+    // The live content-column width (the --dsh-chat-content-width axis).
+    private var contentDp by mutableStateOf(androidx.compose.ui.unit.Dp.Unspecified)
+
     @Composable
     private fun ChatSurface() {
         Surface(modifier = Modifier.fillMaxSize(), color = dsw.bgBase) {
             Column(modifier = Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
                 TopBar(onSettings = { showSettings = true })
-                // DSH ChatView.frame: transcript and composer share the same
-                // content axis; the transcript is 32px narrower each side
-                // than the composer card's clearance rule (ChatView.module.css
-                // .scroll: padding 16px calc(clearance + 16px)).
-                Box(Modifier.weight(1f).fillMaxWidth()) {
-                    Transcript(rows, Modifier.fillMaxSize())
-                    if (!followingTail) {
-                        ToBottomButton { followingTail = false }
+                // The adaptive axis: content width from the ported solver,
+                // exactly what --dsh-chat-content-width resolves to.
+                androidx.compose.foundation.layout.BoxWithConstraints(
+                    Modifier.weight(1f).fillMaxWidth(),
+                ) {
+                    val columnPx = with(androidx.compose.ui.platform.LocalDensity.current) {
+                        maxWidth.toPx().toInt()
+                    }
+                    val contentWidth = Width.resolveContentWidth(columnPx, widthPref)
+                    contentDp = with(androidx.compose.ui.platform.LocalDensity.current) {
+                        androidx.compose.ui.unit.Dp(contentWidth.toFloat())
+                    }
+                    val left = Width.handleVisible(columnPx, contentWidth)
+                    Box(Modifier.fillMaxSize()) {
+                        Transcript(rows, Modifier.fillMaxSize(), contentDp)
+                        if (left) {
+                            WidthHandle(leftHandle = true, columnPx, contentWidth)
+                        }
+                        WidthHandle(leftHandle = false, columnPx, contentWidth)
+                        if (!followingTail) {
+                            ToBottomButton { followingTail = false }
+                        }
                     }
                 }
-                Composer()
+                Composer(contentDp)
             }
             if (showSettings) {
                 SettingsSheet(config) { updated ->
@@ -266,6 +290,57 @@ class ChatActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * A width handle: a 10px edge strip with the drag feel of the official
+     * client — pointer-captured, frame-coalesced by composition itself, ×2
+     * symmetric delta, no inertia, commit only on a real drag. Sits 24px
+     * outside the content column (ConversationRoot.module.css .widthHandle).
+     */
+    @Composable
+    private fun androidx.compose.foundation.layout.BoxScope.WidthHandle(
+        leftHandle: Boolean,
+        columnPx: Int,
+        contentWidth: Int,
+    ) {
+        var originX by remember { mutableStateOf(0f) }
+        var baseWidth by remember { mutableStateOf(0) }
+        var latestX by remember { mutableStateOf(0f) }
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val stripPx = with(density) { Width.handleWidthPx(columnPx, contentWidth).dp.toPx() }
+        Surface(
+            color = Color.Transparent,
+            modifier = Modifier
+                .align(if (leftHandle) Alignment.CenterStart else Alignment.CenterEnd)
+                .widthIn(min = 10.dp)
+                .fillMaxSize(0.02f)
+                .pointerInput(leftHandle) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val down = awaitFirstDown()
+                            originX = down.position.x
+                            latestX = originX
+                            baseWidth = Width.resolveContentWidth(columnPx, widthPref)
+                            var moved = false
+                            // Pointer capture is implicit in pointerInput scope:
+                            // events keep arriving while the finger is down.
+                            drag(down.id) {
+                                latestX = it.position.x
+                                moved = moved || kotlin.math.abs(latestX - originX) > 0.5f
+                                widthPref = Width.draggedWidth(baseWidth, originX, latestX, leftHandle)
+                            }
+                            // Commit only on a real drag (the onCommit guard).
+                            if (moved) {
+                                getSharedPreferences("qrpdsh", Context.MODE_PRIVATE)
+                                    .edit().putInt(Width.WIDTH_PREF_KEY, widthPref ?: 0).apply()
+                            } else {
+                                widthPref = baseWidth
+                            }
+                        }
+                    }
+                },
+        ) {}
     }
 
     @Composable
@@ -295,7 +370,7 @@ class ChatActivity : ComponentActivity() {
     private val ResponseGap = 12.dp
 
     @Composable
-    private fun Transcript(rows: List<ChatRow>, modifier: Modifier = Modifier) {
+    private fun Transcript(rows: List<ChatRow>, modifier: Modifier = Modifier, contentWidth: androidx.compose.ui.unit.Dp = androidx.compose.ui.unit.Dp.Unspecified) {
         val listState = rememberLazyListState()
         // The follow contract (data-chat-following-tail): pinned to the tail
         // until the user scrolls away; then the to-bottom float appears.
@@ -311,8 +386,12 @@ class ChatActivity : ComponentActivity() {
             }
         }
         // .scroll: padding 16px calc(clearance+16px) — the transcript sits 16px
-        // further in than the composer card's 32px clearance.
-        Column(modifier = modifier.fillMaxWidth().padding(horizontal = Width.composerSideClearance + 16.dp)) {
+        // further in than the composer card's clearance. The message column is
+        // the content-width axis, centered (.column max-width + margin auto).
+        Column(
+            modifier = modifier.fillMaxWidth().padding(horizontal = Width.transcriptSidePadding),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
             if (rows.isEmpty()) {
                 Text(
                     "No messages yet. Set the API key in settings, then send a message.",
@@ -334,7 +413,11 @@ class ChatActivity : ComponentActivity() {
                             rows[index - 1] is ChatRow.Assistant -> ResponseGap
                             else -> FlowGap
                         }
-                        Box(Modifier.padding(top = if (index == 0) 16.dp else topGap)) {
+                        Box(
+                            Modifier.padding(top = if (index == 0) 16.dp else topGap)
+                                .then(if (contentWidth != androidx.compose.ui.unit.Dp.Unspecified)
+                                    Modifier.widthIn(max = contentWidth) else Modifier),
+                        ) {
                             when (row) {
                                 is ChatRow.User -> UserBubble(row.text)
                                 is ChatRow.Assistant -> AssistantText(row.text)
@@ -484,13 +567,14 @@ class ChatActivity : ComponentActivity() {
      * side clearance 32px.
      */
     @Composable
-    private fun Composer() {
+    private fun Composer(contentWidth: androidx.compose.ui.unit.Dp) {
         var text by remember { mutableStateOf("") }
         Column(
             modifier = Modifier.fillMaxWidth().padding(horizontal = Width.composerSideClearance * 2, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Column(
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().widthIn(max = contentWidth)
                     .background(dsw.inputMajor, RoundedCornerShape(28.dp))
                     .border(0.5.dp, dsw.borderL2, RoundedCornerShape(28.dp))
                     .padding(top = 8.dp, bottom = 8.dp),
