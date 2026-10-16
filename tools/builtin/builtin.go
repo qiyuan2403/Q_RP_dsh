@@ -12,14 +12,17 @@ package builtintools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
+	"github.com/qiyuan2403/Q_RP_dsh/tools/shell"
 )
 
 // Options configures the tool set.
@@ -36,6 +39,11 @@ type Options struct {
 	// AllowShell enables the shell tool. It is a separate switch because a
 	// deployment may want file access without command execution.
 	AllowShell bool
+	// Interpreter is the shell executor the shell tool runs on. Zero means
+	// the platform default. Exactly one executor is mounted per registry:
+	// the official harness fails a duplicate mount loudly rather than
+	// silently replacing, and so does this one.
+	Interpreter shell.Executor
 }
 
 func (o *Options) withDefaults() Options {
@@ -54,12 +62,49 @@ func (o *Options) withDefaults() Options {
 	if out.ShellTimeout <= 0 {
 		out.ShellTimeout = 2 * time.Minute
 	}
+	// Exactly one shell executor is mounted: the explicit one when given,
+	// the platform default otherwise. A second mount is refused at Register
+	// rather than silently replacing what an existing conversation resolves.
+	if out.Interpreter.Command == "" {
+		out.Interpreter = shell.PlatformInterpreter(runtime.GOOS)
+	}
+	if out.Interpreter.Budgets.MaxOutputBytes <= 0 {
+		out.Interpreter.Budgets.MaxOutputBytes = out.MaxOutputBytes
+	}
+	if out.Interpreter.Budgets.DefaultTimeout <= 0 {
+		out.Interpreter.Budgets.DefaultTimeout = out.ShellTimeout
+	}
+	// The managed overlay carries the harness facts the model reads: the
+	// home the shell tool is bounded by, and the interpreter that runs. The
+	// registry owns the reserved keys, so a future contributor cannot
+	// shadow these.
+	if out.Interpreter.Budgets.Env == nil {
+		env := shell.NewEnvRegistry(out.Root)
+		managed, err := env.Collect()
+		if err == nil {
+			out.Interpreter.Budgets.Env = managed
+		}
+		// A Collect failure leaves the overlay off: the command still starts
+		// from the scrubbed base, it just reads no DSH_* facts. That is
+		// degraded, not broken.
+	}
 	return out
 }
 
 // Register adds the tools to a registry.
+//
+// Registering twice with AllowShell is a duplicate shell mount: the second
+// call fails loudly rather than silently replacing the executor an existing
+// conversation's tool calls resolve to. The registry already refuses a
+// duplicate tool name with the same semantics; this guard only names the
+// cause in the error the caller sees.
 func Register(r *tools.Registry, opts Options) error {
 	cfg := opts.withDefaults()
+	if cfg.AllowShell {
+		if _, exists := r.Lookup("bash"); exists {
+			return errors.New("builtintools: a shell tool is already registered; exactly one shell executor may be mounted")
+		}
+	}
 	for _, t := range []tools.Tool{
 		readTool(cfg),
 		writeTool(cfg),
@@ -256,7 +301,11 @@ func editTool(cfg Options) tools.Tool {
 			if err != nil {
 				return nil, err
 			}
-			text := string(data)
+			// THE EOL CONTRACT: the model supplies LF text; the file may be
+			// CRLF. Compare and replace in the canonical LF form, then
+			// restore the file's own style on write-back, so a CRLF file is
+			// not silently rewritten to LF and an LF `old` still matches.
+			text, style := forEdit(data)
 			count := strings.Count(text, in.Old)
 			switch {
 			case count == 0:
@@ -264,7 +313,7 @@ func editTool(cfg Options) tools.Tool {
 			case count > 1:
 				return nil, fmt.Errorf("the old text appears %d times in %s; include more context to make it unique", count, in.Path)
 			}
-			updated := strings.Replace(text, in.Old, in.New, 1)
+			updated := restoreLineEndings(strings.Replace(text, in.Old, in.New, 1), style)
 			if err := os.WriteFile(full, []byte(updated), 0o644); err != nil {
 				return nil, err
 			}
@@ -313,10 +362,24 @@ func listTool(cfg Options) tools.Tool {
 }
 
 func shellTool(cfg Options) tools.Tool {
+	description := "Execute a shell command and return its stdout/stderr. " +
+		"Each call runs in a fresh shell; pass a path relative to the working directory instead of using `cd`. " +
+		"Long output is truncated to its tail. " +
+		"An unset variable expands to an empty string, so guard variables with `${VAR:?}`. " +
+		"Before any delete or move, verify that the resolved absolute target path is the intended one; never run it against a computed path you have not checked. " +
+		"Non-zero exits are reported as `[exit code: N]` markers: investigate failures before moving on, and never retry a `[sandbox: ...]` denial another way."
+	if shell.IsMksh(cfg.Interpreter.Command) {
+		// The interpreter's dialect is part of the contract, not trivia: a
+		// model assuming bash on mksh generates `[[ ]]` and array syntax that
+		// mksh rejects or misparses, which is exactly how a Windows-shaped
+		// harness produced its bashism errors.
+		description += " The interpreter is mksh, not bash: `[[ ]]` is unavailable (use `[ ]`), arrays exist but differ, and some bash builtins such as `read -a` are missing."
+	} else if cfg.Interpreter.Command != "" {
+		description += " The interpreter is " + cfg.Interpreter.Command + "."
+	}
 	return tools.Tool{
-		Name: "bash",
-		Description: "Run a shell command in the working directory. " +
-			"Returns the exit code and the captured output.",
+		Name:        "bash",
+		Description: description,
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -336,61 +399,73 @@ func shellTool(cfg Options) tools.Tool {
 			if strings.TrimSpace(in.Command) == "" {
 				return nil, fmt.Errorf("command is empty")
 			}
-			timeout := cfg.ShellTimeout
+			executor := cfg.Interpreter
 			if in.TimeoutMS > 0 {
-				timeout = time.Duration(in.TimeoutMS) * time.Millisecond
+				requested := time.Duration(in.TimeoutMS) * time.Millisecond
+				if requested > executor.Budgets.MaxTimeout {
+					requested = executor.Budgets.MaxTimeout
+				}
+				executor.Budgets.DefaultTimeout = requested
 			}
-			runCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-
-			cmd := exec.CommandContext(runCtx, "bash", "-c", in.Command)
-			cmd.Dir = cfg.Root
-			// The environment is the process's own: a shell command is an
-			// explicit user-authorized action, unlike a config expression.
-			cmd.Env = os.Environ()
-
-			var buf strings.Builder
-			cmd.Stdout = &limitedWriter{buf: &buf, limit: cfg.MaxOutputBytes}
-			cmd.Stderr = &limitedWriter{buf: &buf, limit: cfg.MaxOutputBytes}
-			err := cmd.Run()
-
-			result := map[string]any{"command": in.Command, "output": buf.String()}
-			if cmd.ProcessState != nil {
-				result["exitCode"] = cmd.ProcessState.ExitCode()
-			}
-			if runCtx.Err() == context.DeadlineExceeded {
-				result["timedOut"] = true
-				return result, fmt.Errorf("command timed out after %s", timeout)
-			}
+			result, err := executor.Run(ctx, cfg.Root, in.Command)
 			if err != nil {
-				// A non-zero exit is a RESULT the model should see, not a tool
-				// failure: the output explains what went wrong.
-				return result, nil
+				// The command never ran: an infrastructure fault the model
+				// cannot read a result from.
+				return nil, err
 			}
-			return result, nil
+			// A finished run is a RESULT, never a tool error: the model reads
+			// the markers and decides what to do next.
+			return map[string]any{
+				"command": in.Command,
+				"output":  shell.Render(result),
+			}, nil
 		},
 	}
 }
 
-// limitedWriter appends to a buffer up to a limit, so a command producing
-// unbounded output cannot exhaust memory.
-type limitedWriter struct {
-	buf   *strings.Builder
-	limit int
+// AttachPromptSections contributes each registered tool's prompt section to
+// the assembly, in the official tool-bash shape: the guidance rides with the
+// tool that carries the behavior, so it cannot drift from it. A tool without
+// a section contributes nothing.
+func AttachPromptSections(r *systemprompt.Registry, registry *tools.Registry) error {
+	for _, name := range registry.Names() {
+		section, ok := toolPromptSection(name)
+		if !ok {
+			continue
+		}
+		if err := r.Section(systemprompt.Section{
+			Name:  section.Name,
+			Order: systemprompt.SectionOrders[section.OrderKey],
+			Text:  section.Text,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (w *limitedWriter) Write(p []byte) (int, error) {
-	remaining := w.limit - w.buf.Len()
-	if remaining <= 0 {
-		// Report success so the command keeps running; the output is truncated
-		// rather than the process killed.
-		return len(p), nil
+// toolSection is one tool-owned prompt section.
+type toolSection struct {
+	Name     string
+	OrderKey string
+	Text     string
+}
+
+// toolPromptSections maps a tool name to the prompt section it owns. The
+// official harness injects the bash guidance from tool-bash itself; the same
+// ownership is preserved here so the text stays next to the behavior.
+func toolPromptSections() map[string]toolSection {
+	return map[string]toolSection{
+		"bash": {
+			Name:     "tool:bash",
+			OrderKey: "TOOL_BASH",
+			Text:     "Check the [exit code: N] marker on every shell result; investigate failures before moving on. Never retry a command whose result carries a `[sandbox: ...]` denial marker another way.",
+		},
 	}
-	if len(p) > remaining {
-		w.buf.Write(p[:remaining])
-		w.buf.WriteString("\n... output truncated")
-		return len(p), nil
-	}
-	w.buf.Write(p)
-	return len(p), nil
+}
+
+// toolPromptSection returns the section a tool owns, if any.
+func toolPromptSection(name string) (toolSection, bool) {
+	s, ok := toolPromptSections()[name]
+	return s, ok
 }

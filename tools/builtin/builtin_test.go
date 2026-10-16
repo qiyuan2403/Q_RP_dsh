@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
+	"github.com/qiyuan2403/Q_RP_dsh/tools/shell"
 )
 
 func newRegistry(t *testing.T, opts Options) *tools.Registry {
@@ -244,8 +246,50 @@ func TestShellToolIsOnlyRegisteredWhenAllowed(t *testing.T) {
 	}
 }
 
+// TestShellInterpreterIsResolved pins the Android case: bash does not exist
+// there, so a hardcoded "bash" would make every command fail with ENOENT. The
+// resolved interpreter must be an absolute path that exists, and an explicit
+// choice must win over the probe.
+func TestShellInterpreterIsResolved(t *testing.T) {
+	opts := Options{Root: t.TempDir()}
+	resolved := opts.withDefaults()
+	if !filepath.IsAbs(resolved.Interpreter.Command) {
+		t.Fatalf("resolved interpreter = %q, want an absolute path", resolved.Interpreter.Command)
+	}
+	if _, err := os.Stat(resolved.Interpreter.Command); err != nil {
+		t.Fatalf("resolved interpreter %q does not exist: %v", resolved.Interpreter.Command, err)
+	}
+
+	explicitOpts := Options{Root: t.TempDir(), Interpreter: shell.Executor{Command: "/bin/echo"}}
+	explicit := explicitOpts.withDefaults()
+	if explicit.Interpreter.Command != "/bin/echo" {
+		t.Fatalf("explicit interpreter = %q, want it kept", explicit.Interpreter.Command)
+	}
+}
+
+// TestShellToolUsesTheConfiguredInterpreter pins that the option reaches the
+// process, not just the struct.
+func TestShellToolUsesTheConfiguredInterpreter(t *testing.T) {
+	root := t.TempDir()
+	interpreter := filepath.Join(root, "fake-shell")
+	if err := os.WriteFile(interpreter, []byte("#!/bin/sh\necho interpreter-was-used\n"), 0o755); err != nil {
+		t.Fatalf("write interpreter: %v", err)
+	}
+
+	r := newRegistry(t, Options{Root: root, AllowShell: true, Interpreter: shell.Executor{Command: interpreter}})
+	got, err := run(t, r, "bash", `{"command":"anything"}`)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	m := got.(map[string]any)
+	if !strings.Contains(m["output"].(string), "interpreter-was-used") {
+		t.Fatalf("output = %v, want the configured interpreter to have run", m["output"])
+	}
+}
+
 // TestShellReportsExitCodeAndOutput pins that a non-zero exit is a RESULT, not
-// a tool failure: the output explains the failure to the model.
+// a tool failure: the rendered output carries the `[exit code: N]` marker the
+// model reads, per the official shell contract.
 func TestShellReportsExitCodeAndOutput(t *testing.T) {
 	root := t.TempDir()
 	r := newRegistry(t, Options{Root: root, AllowShell: true})
@@ -257,8 +301,8 @@ func TestShellReportsExitCodeAndOutput(t *testing.T) {
 	if !strings.Contains(m["output"].(string), "hello") {
 		t.Fatalf("output = %v", m["output"])
 	}
-	if m["exitCode"] != 3 {
-		t.Fatalf("exitCode = %v, want 3", m["exitCode"])
+	if !strings.Contains(m["output"].(string), "[exit code: 3]") {
+		t.Fatalf("output does not carry the exit marker: %v", m["output"])
 	}
 }
 
@@ -281,19 +325,22 @@ func TestShellRunsInTheRootDirectory(t *testing.T) {
 }
 
 // TestShellTimesOut pins the timeout, so a hung command cannot stall a turn.
+// Under the contract a timeout is a RESULT with the `[timed out after Nms]`
+// marker, not a tool error.
 func TestShellTimesOut(t *testing.T) {
 	r := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true, ShellTimeout: 200 * time.Millisecond})
 	start := time.Now()
 	got, err := run(t, r, "bash", `{"command":"sleep 5"}`)
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("a hung command was not reported")
+	if err != nil {
+		t.Fatalf("a timeout must not be a tool failure: %v", err)
 	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("timeout took %s", elapsed)
 	}
-	if m, ok := got.(map[string]any); ok && m["timedOut"] != true {
-		t.Fatalf("result = %v, want timedOut", m)
+	output := got.(map[string]any)["output"].(string)
+	if !strings.Contains(output, "[timed out after") {
+		t.Fatalf("output does not carry the timeout marker: %q", output)
 	}
 }
 
@@ -318,5 +365,106 @@ func TestShellRefusesAnEmptyCommand(t *testing.T) {
 	r := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true})
 	if _, err := run(t, r, "bash", `{"command":"   "}`); err == nil {
 		t.Fatal("an empty command was accepted")
+	}
+}
+
+// TestShellDescriptionNamesTheMkshDialect pins that an Android-resolved
+// interpreter carries the mksh dialect warning: a model assuming bash there
+// is the exact error class the official harness records for Windows.
+func TestShellDescriptionNamesTheMkshDialect(t *testing.T) {
+	opts := Options{
+		Root:        t.TempDir(),
+		AllowShell:  true,
+		Interpreter: shell.Executor{Command: "/system/bin/sh"},
+	}
+	r := tools.NewRegistry()
+	if err := Register(r, opts); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	tool, ok := r.Lookup("bash")
+	if !ok {
+		t.Fatal("bash tool missing")
+	}
+	if !strings.Contains(tool.Description, "mksh, not bash") {
+		t.Fatalf("description does not name the mksh dialect: %q", tool.Description)
+	}
+}
+
+// TestShellDescriptionOnPosixDoesNotWarnMksh pins that a POSIX interpreter
+// does not carry the mksh warning.
+func TestShellDescriptionOnPosixDoesNotWarnMksh(t *testing.T) {
+	r := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true})
+	tool, ok := r.Lookup("bash")
+	if !ok {
+		t.Fatal("bash tool missing")
+	}
+	if strings.Contains(tool.Description, "mksh, not bash") {
+		t.Fatalf("POSIX description warns about mksh: %q", tool.Description)
+	}
+}
+
+// TestShellRenderCarriesMarkers pins that the tool returns the rendered
+// contract: a timeout arrives as a marker in the output, not as an error.
+func TestShellRenderCarriesMarkers(t *testing.T) {
+	r := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true, ShellTimeout: 150 * time.Millisecond})
+	got, err := run(t, r, "bash", `{"command":"sleep 3"}`)
+	if err != nil {
+		t.Fatalf("a timeout must not be a tool failure: %v", err)
+	}
+	output := got.(map[string]any)["output"].(string)
+	if !strings.Contains(output, "[timed out after") {
+		t.Fatalf("output = %q, want the timeout marker", output)
+	}
+}
+
+// TestDuplicateShellMountIsRefused pins the single-executor rule: the second
+// registration with AllowShell fails loudly rather than silently replacing.
+func TestDuplicateShellMountIsRefused(t *testing.T) {
+	r := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true})
+	if err := Register(r, Options{Root: t.TempDir(), AllowShell: true}); err == nil {
+		t.Fatal("a duplicate shell mount was accepted")
+	}
+}
+
+// TestAttachPromptSectionsPinsTheBashGuidance pins that the bash tool owns
+// its prompt section and that it rides with registration, not a central block.
+func TestAttachPromptSectionsPinsTheBashGuidance(t *testing.T) {
+	r := systemprompt.New()
+	registry := newRegistry(t, Options{Root: t.TempDir(), AllowShell: true})
+	if err := AttachPromptSections(r, registry); err != nil {
+		t.Fatalf("AttachPromptSections: %v", err)
+	}
+	assembly, err := r.Assemble(systemprompt.AssembleContext{})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	text, err := systemprompt.Render(assembly)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(text, "Check the [exit code: N] marker") {
+		t.Fatalf("assembled prompt lacks the bash guidance: %q", text)
+	}
+}
+
+// TestAttachPromptSectionsWithoutShell pins that a deployment without the
+// shell tool gets no shell guidance: the section is owned by the tool, so an
+// unmounted tool contributes nothing.
+func TestAttachPromptSectionsWithoutShell(t *testing.T) {
+	r := systemprompt.New()
+	registry := newRegistry(t, Options{Root: t.TempDir()})
+	if err := AttachPromptSections(r, registry); err != nil {
+		t.Fatalf("AttachPromptSections: %v", err)
+	}
+	assembly, err := r.Assemble(systemprompt.AssembleContext{})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	text, err := systemprompt.Render(assembly)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(text, "Check the [exit code: N] marker") {
+		t.Fatalf("shell guidance present without the shell tool: %q", text)
 	}
 }
