@@ -41,6 +41,9 @@ data class Dsw(
     // --dsw-specific-input-major: the composer card fill. Light bluish-00,
     // dark bluish-850 (269/387).
     val inputMajor: Color,
+    // --dsw-specific-sidebar-fill: the sidebar column fill. Light bluish-50
+    // #F9FAFB, dark bluish-900 #1B1B1C (design-platform.css:275/393).
+    val sidebarFill: Color,
     val buttonPrimaryFill: Color,
     val buttonPrimaryHover: Color,
     val buttonGhostActiveFill: Color,
@@ -84,6 +87,8 @@ val DswLight = Dsw(
     bubble = Color(0xFFEDF3FE),
     // bluish-00
     inputMajor = Color(0xFFFFFFFF),
+    // bluish-50 rgb(249,250,251)
+    sidebarFill = Color(0xFFF9FAFB),
 )
 
 /** The dark theme: the token values the official dark build ships. */
@@ -111,6 +116,8 @@ val DswDark = DswLight.copy(
     // bluish-850 rgb(44,44,46)
     bubble = Color(0xFF2C2C2E),
     inputMajor = Color(0xFF2C2C2E),
+    // bluish-900 rgb(27,27,28)
+    sidebarFill = Color(0xFF1B1B1C),
 )
 
 /**
