@@ -16,23 +16,8 @@
 
 ## 目标平台
 
-**Android 优先**，Windows 双线开发。底层实现可以不同，但契约一致。
-
-### Android 存储的两条硬约束
-
-在真实 Android 设备上实测（非推断）：
-
-| 路径 | 挂载 | 可写 | 可执行 |
-|---|---|---|---|
-| `/storage/emulated/0`（共享存储） | tmpfs **`noexec`** | ✅ | ❌ `EACCES` |
-| 私有目录 | ext4 | ✅ | ✅ |
-
-因此工作区必须区分**数据根**与**执行根**：
-
-- **数据根**：用户可见的文档（角色卡、导出图、会话归档），常在共享存储
-- **执行根**：必须可执行（Node worker 脚本、helper 二进制），只能是私有目录
-
-能力**全部实测**（写文件 → chmod → 执行），不从路径或系统名推断。判定依据是 **errno**（`EACCES`/`EPERM`），不是退出码——探针脚本非零退出**证明**目录可执行。
+**Android**
+**windows**
 
 ## 核心业务：角色卡工坊
 
@@ -59,7 +44,7 @@
 
 ## 兼容性：以 RP-Hub 为标准
 
-角色卡读写**逐条对齐** [RP-Hub](https://github.com/STA1N156/RP-Hub) 的实现（`assets/js/core-utils.js`）。四处容易做错、且已用测试钉住的行为：
+角色卡读写
 
 | 项 | RP-Hub 行为 | 说明 |
 |---|---|---|
@@ -87,15 +72,9 @@ Agent 主循环、工具调度、会话持久化、卡片处理**全部纯 Go**�
 
 ## 许可证
 
-[CC BY-NC 4.0](./LICENSE) —— 与 [RP-Hub](https://github.com/STA1N156/RP-Hub) 相同。
+[CC BY-NC 4.0](./LICENSE)
 
 **明确禁止任何形式的商业化使用。**
-
-## 标准
-
-**永远以 [STA1N156/RP-Hub](https://github.com/STA1N156/RP-Hub) 的官方最新版为唯一标准。**
-
-当前钉版：commit [`3e7c706`](https://github.com/STA1N156/RP-Hub/commit/3e7c7064e2c72085d18e729fb2c0260c1894ae2c)（2026-10-15）。
 
 ---
 
