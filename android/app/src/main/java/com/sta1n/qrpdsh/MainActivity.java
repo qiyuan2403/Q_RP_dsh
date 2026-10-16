@@ -166,7 +166,7 @@ public class MainActivity extends Activity {
                 String nodePath = nodeExecutable;
                 String result;
                 try {
-                    result = Native.runTurn(task, home, home, baseUrl, apiKey, model, nodePath);
+                    result = Native.runTurn(task, home, home, baseUrl, apiKey, model, nodePath, null);
                 } catch (Throwable t) {
                     // A crash across the JNI boundary must not take the activity
                     // down; surface it as text like any other failure.

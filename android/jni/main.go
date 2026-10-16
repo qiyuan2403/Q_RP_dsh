@@ -35,12 +35,13 @@ const Version = "0.0.1"
 
 // runRequest is the JSON the app sends for one turn.
 type runRequest struct {
-	Task    string `json:"task"`
-	WorkDir string `json:"workDir"`
-	BaseURL string `json:"baseUrl"`
-	APIKey  string `json:"apiKey"`
-	Model   string `json:"model"`
-	Home    string `json:"home"`
+	Task      string `json:"task"`
+	WorkDir   string `json:"workDir"`
+	BaseURL   string `json:"baseUrl"`
+	APIKey    string `json:"apiKey"`
+	Model     string `json:"model"`
+	Home      string `json:"home"`
+	SessionID string `json:"sessionId,omitempty"`
 	// NodePath is the embedded node executable extracted by the app
 	// (NodeRuntime). Empty means the JS layer is unavailable: !!js
 	// expressions fail loudly and npm plugins stay dormant.
@@ -147,16 +148,29 @@ func runTurnJSON(req runRequest) string {
 		return encode(runResponse{Error: err.Error()})
 	}
 
-	id := session.NewID()
-	log, err := session.Create(home+"/sessions/"+id, session.Header{
-		ID:        id,
-		CreatedAt: time.Now().UnixMilli(),
-		CWD:       workDir,
-	})
-	if err != nil {
-		return encode(runResponse{Error: err.Error()})
+	// A turn runs against the session the UI opened (reusing its history so
+	// the conversation continues), or its own when no session was passed —
+	// which is how the JSON entry point stays testable without a UI.
+	var log *session.Log
+	if req.SessionID != "" {
+		sessionsMu.Lock()
+		log = sessions[req.SessionID]
+		sessionsMu.Unlock()
+		if log == nil {
+			return encode(runResponse{Error: "unknown session: " + req.SessionID})
+		}
+	} else {
+		id := session.NewID()
+		log, err = session.Create(home+"/sessions/"+id, session.Header{
+			ID:        id,
+			CreatedAt: time.Now().UnixMilli(),
+			CWD:       workDir,
+		})
+		if err != nil {
+			return encode(runResponse{Error: err.Error()})
+		}
+		defer log.Close()
 	}
-	defer log.Close()
 
 	a := agent.New(agent.Config{
 		Provider:     openaichat.New(openaichat.Config{BaseURL: req.BaseURL, APIKey: req.APIKey}),

@@ -56,10 +56,10 @@ func Java_com_sta1n_qrpdsh_Native_version(env *C.JNIEnv, clazz C.jclass) C.jstri
 }
 
 //export Java_com_sta1n_qrpdsh_Native_runTurn
-func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, home, workDir, baseURL, apiKey, model, nodePath C.jstring) C.jstring {
+func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, home, workDir, baseURL, apiKey, model, nodePath, sessionID C.jstring) C.jstring {
 	// Each Java String is copied out before use: the JNI reference is only
 	// valid while the JVM keeps it alive, so the Go side must not retain it.
-	args := []C.jstring{task, home, workDir, baseURL, apiKey, model, nodePath}
+	args := []C.jstring{task, home, workDir, baseURL, apiKey, model, nodePath, sessionID}
 	cp := make([]*C.char, len(args))
 	for i, a := range args {
 		cp[i] = C.jni_cstr(env, a)
@@ -71,13 +71,14 @@ func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, h
 	}()
 
 	req := runRequest{
-		Task:     C.GoString(cp[0]),
-		Home:     C.GoString(cp[1]),
-		WorkDir:  C.GoString(cp[2]),
-		BaseURL:  C.GoString(cp[3]),
-		APIKey:   C.GoString(cp[4]),
-		Model:    C.GoString(cp[5]),
-		NodePath: C.GoString(cp[6]),
+		Task:      C.GoString(cp[0]),
+		Home:      C.GoString(cp[1]),
+		WorkDir:   C.GoString(cp[2]),
+		BaseURL:   C.GoString(cp[3]),
+		APIKey:    C.GoString(cp[4]),
+		Model:     C.GoString(cp[5]),
+		NodePath:  C.GoString(cp[6]),
+		SessionID: C.GoString(cp[7]),
 	}
 	out := runTurnJSON(req)
 	return C.jni_string(env, C.CString(out))

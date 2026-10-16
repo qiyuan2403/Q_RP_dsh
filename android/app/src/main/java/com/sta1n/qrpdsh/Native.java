@@ -49,7 +49,7 @@ public final class Native {
      */
     public static native String runTurn(String task, String home, String workDir,
                                         String baseUrl, String apiKey, String model,
-                                        String nodePath);
+                                        String nodePath, String sessionId);
 
     /**
      * Opens (or resumes) the newest session under {@code home} and returns a
