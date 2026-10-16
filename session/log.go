@@ -85,6 +85,12 @@ type Event struct {
 }
 
 // Log is an append-only session event log backed by one JSONL file.
+//
+// It is also the live event source for readers: a subscriber registered with
+// Subscribe receives every event as it is appended. That is what lets a UI
+// follow a running turn without polling the file, and it keeps the log the one
+// authority for what happened — a reader never reconstructs state from a
+// separate channel that could disagree with the file.
 type Log struct {
 	mu     sync.Mutex
 	path   string
@@ -95,6 +101,75 @@ type Log struct {
 	seq int64
 	// closed reports whether the log has been closed.
 	closed bool
+	// subs are the live subscribers, keyed by id so removal is O(1) and a
+	// subscriber that unsubscribes during delivery does not corrupt the walk.
+	subs map[int64]chan Event
+	// nextSubID hands out subscriber ids.
+	nextSubID int64
+}
+
+// Subscribe returns a channel receiving every event appended after this call,
+// and a function that unsubscribes and closes the channel.
+//
+// The channel is buffered but bounded: a reader that falls behind loses events
+// rather than stalling the agent loop, because blocking an append on a slow
+// reader would let a UI freeze a turn. A dropped event is recoverable — the log
+// file is the durable record, and a reader that needs certainty re-reads it —
+// whereas a stalled append is not.
+func (l *Log) Subscribe(buffer int) (<-chan Event, func()) {
+	if buffer <= 0 {
+		buffer = 64
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		ch := make(chan Event)
+		close(ch)
+		return ch, func() {}
+	}
+	if l.subs == nil {
+		l.subs = make(map[int64]chan Event)
+	}
+	l.nextSubID++
+	id := l.nextSubID
+	ch := make(chan Event, buffer)
+	l.subs[id] = ch
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			if c, ok := l.subs[id]; ok {
+				delete(l.subs, id)
+				close(c)
+			}
+		})
+	}
+}
+
+// publish delivers an event to every subscriber.
+//
+// The caller must NOT hold l.mu: a subscriber may append to the log in
+// response to an event, and delivering under the lock would deadlock that
+// re-entry. Delivery therefore happens after the lock is released, which is
+// also why publish takes a snapshot of the channels.
+func (l *Log) publish(e Event) {
+	l.mu.Lock()
+	subs := make([]chan Event, 0, len(l.subs))
+	for _, ch := range l.subs {
+		subs = append(subs, ch)
+	}
+	l.mu.Unlock()
+
+	for _, ch := range subs {
+		select {
+		case ch <- e:
+		default:
+			// The subscriber is behind. Drop rather than block: the log file
+			// still holds the event, so a reader can recover by re-reading.
+		}
+	}
 }
 
 // HeaderFilename is the metadata file's name beside the log.
@@ -177,6 +252,19 @@ func (l *Log) Path() string { return l.path }
 // An unknown type is refused unless the caller marked it ignorable: writing a
 // type this build does not understand would produce a log it cannot read back.
 func (l *Log) Append(e Event) (Event, error) {
+	e, err := l.append(e)
+	if err != nil {
+		return Event{}, err
+	}
+	// Published outside the lock: a subscriber may append in response, and
+	// holding the lock across delivery would deadlock that re-entry.
+	l.publish(e)
+	return e, nil
+}
+
+// append writes one event under the lock and returns it. It does not publish;
+// Append does, after the lock is released.
+func (l *Log) append(e Event) (Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
@@ -228,23 +316,32 @@ func (l *Log) Flush() error {
 	return l.file.Sync()
 }
 
-// Close flushes and closes the log.
+// Close flushes and closes the log, then closes every subscriber's channel.
+//
+// Closing the channels is what tells a reader the log has ended: a receiver
+// sees the close and stops waiting, instead of blocking forever on a log that
+// will never produce another event.
 func (l *Log) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
+		l.mu.Unlock()
 		return nil
 	}
 	l.closed = true
-	if err := l.writer.Flush(); err != nil {
-		_ = l.file.Close()
+	for id, ch := range l.subs {
+		delete(l.subs, id)
+		close(ch)
+	}
+	err := l.writer.Flush()
+	if err == nil {
+		err = l.file.Sync()
+	}
+	closeErr := l.file.Close()
+	l.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	if err := l.file.Sync(); err != nil {
-		_ = l.file.Close()
-		return err
-	}
-	return l.file.Close()
+	return closeErr
 }
 
 // ReadLog reads every event from a session directory.
