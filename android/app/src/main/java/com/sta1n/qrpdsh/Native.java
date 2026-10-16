@@ -60,4 +60,12 @@ public final class Native {
 
     /** Closes one session, flushing its log to disk. */
     public static native void closeSession(String id);
+
+    /**
+     * Blocks up to {@code timeoutMs} waiting for one live event from the
+     * session's running turn. Returns the event as JSON, or "" when the
+     * window expired (poll again) or the stream ended (turn finished).
+     * MUST be called off the UI thread; it blocks.
+     */
+    public static native String pollEvent(String sessionId, int timeoutMs);
 }

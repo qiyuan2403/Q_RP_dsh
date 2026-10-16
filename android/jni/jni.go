@@ -155,3 +155,39 @@ func Java_com_sta1n_qrpdsh_Native_closeSession(env *C.JNIEnv, clazz C.jclass, id
 		_ = log.Close()
 	}
 }
+
+// pollEventNative blocks until one live event for the session arrives, then
+// returns it as JSON. Returns an empty string when the stream is over — the
+// turn finished or the session is unknown. The caller polls on a dedicated
+// Java worker thread, so every JNIEnv use here belongs to the JVM: no Go
+// thread ever calls back into it.
+//
+//export Java_com_sta1n_qrpdsh_Native_pollEvent
+func Java_com_sta1n_qrpdsh_Native_pollEvent(env *C.JNIEnv, clazz C.jclass, sessionID C.jstring, timeoutMs C.jint) C.jstring {
+	cID := C.jni_cstr(env, sessionID)
+	defer C.free(unsafe.Pointer(cID))
+	goID := C.GoString(cID)
+
+	streamsMu.Lock()
+	ch, ok := eventStreams[goID]
+	streamsMu.Unlock()
+	if !ok {
+		return C.jni_string(env, C.CString(""))
+	}
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	select {
+	case e, open := <-ch:
+		if !open {
+			return C.jni_string(env, C.CString(""))
+		}
+		raw, err := json.Marshal(e)
+		if err != nil {
+			return C.jni_string(env, C.CString(""))
+		}
+		return C.jni_string(env, C.CString(string(raw)))
+	case <-time.After(timeout):
+		// No event within the window: an empty string means "poll again".
+		return C.jni_string(env, C.CString(""))
+	}
+}

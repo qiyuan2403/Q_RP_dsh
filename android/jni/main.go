@@ -187,6 +187,24 @@ func runTurnJSON(req runRequest) string {
 		MaxSteps:     32,
 	}, log)
 
+	// Live events: subscribe before the turn, keep the channel keyed by
+	// session id for pollEvent to drain on Java threads. A sessionless turn
+	// (the test entry point) publishes nothing.
+	var unsub func()
+	if req.SessionID != "" {
+		ch, u := log.Subscribe(128)
+		unsub = u
+		streamsMu.Lock()
+		eventStreams[req.SessionID] = ch
+		streamsMu.Unlock()
+		defer func() {
+			unsub()
+			streamsMu.Lock()
+			delete(eventStreams, req.SessionID)
+			streamsMu.Unlock()
+		}()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -235,4 +253,14 @@ func main() {}
 var (
 	sessionsMu sync.Mutex
 	sessions   = map[string]*session.Log{}
+)
+
+// eventStreams carries the live event channels of running turns, keyed by
+// session id. runTurn subscribes before the turn starts; pollEvent drains
+// one event per call. The poll calls happen on JAVA threads — the JVM owns
+// every JNIEnv we use, which is why events cross the boundary by polling and
+// never by a Go thread calling back into the JVM.
+var (
+	streamsMu    sync.Mutex
+	eventStreams = map[string]<-chan session.Event{}
 )
