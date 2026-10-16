@@ -17,3 +17,6 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
+
+# CI-only kernel checkout
+_kernel/

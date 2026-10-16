@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The harness depends on the kernel repository. CI checks it out into a
+      # subdirectory and points a workspace file at it, so the kernel revision
+      # under test is the current one rather than a released version.
+      - name: Check out the kernel
+        uses: actions/checkout@v4
+        with:
+          repository: qiyuan2403/Y_Cordis
+          path: _kernel
+
+      - name: Point the workspace at the checked-out kernel
+        shell: bash
+        run: |
+          cat > go.work <<'WORK'
+          go 1.27.1
+
+          use (
+          	.
+          	./_kernel
+          )
+          WORK
+          cat go.work
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./... -count=1 -timeout 10m
