@@ -8,6 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBars
@@ -22,9 +24,11 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -43,11 +47,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.sta1n.qrpdsh.ui.Dsw
+import com.sta1n.qrpdsh.ui.Width
 import com.sta1n.qrpdsh.ui.DswDark
 import com.sta1n.qrpdsh.ui.DswLight
 import kotlinx.coroutines.Dispatchers
@@ -73,6 +80,7 @@ class ChatActivity : ComponentActivity() {
     private var nodeExecutable by mutableStateOf<String?>(null)
     private var turnRunning by mutableStateOf(false)
     private var showSettings by mutableStateOf(false)
+    private var followingTail by mutableStateOf(true)
     private var config by mutableStateOf(Config.EMPTY)
     private var dsw: Dsw = DswLight
 
@@ -238,7 +246,16 @@ class ChatActivity : ComponentActivity() {
         Surface(modifier = Modifier.fillMaxSize(), color = dsw.bgBase) {
             Column(modifier = Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
                 TopBar(onSettings = { showSettings = true })
-                Transcript(rows, Modifier.weight(1f))
+                // DSH ChatView.frame: transcript and composer share the same
+                // content axis; the transcript is 32px narrower each side
+                // than the composer card's clearance rule (ChatView.module.css
+                // .scroll: padding 16px calc(clearance + 16px)).
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    Transcript(rows, Modifier.fillMaxSize())
+                    if (!followingTail) {
+                        ToBottomButton { followingTail = false }
+                    }
+                }
                 Composer()
             }
             if (showSettings) {
@@ -272,20 +289,34 @@ class ChatActivity : ComponentActivity() {
         }
     }
 
+    // The DSH flow gaps (ChatView.module.css): 6px default, 12px between a
+    // response row and its neighbours, 16px around a turn boundary.
+    private val FlowGap = 6.dp
+    private val ResponseGap = 12.dp
+
     @Composable
     private fun Transcript(rows: List<ChatRow>, modifier: Modifier = Modifier) {
         val listState = rememberLazyListState()
-        // Follow the tail while new rows land, the DSH scroll contract: a
-        // streaming transcript stays pinned to the bottom until the user
-        // scrolls away.
-        LaunchedEffect(rows.size) {
-            if (rows.isNotEmpty()) listState.animateScrollToItem(rows.size - 1)
+        // The follow contract (data-chat-following-tail): pinned to the tail
+        // until the user scrolls away; then the to-bottom float appears.
+        LaunchedEffect(rows.size, followingTail) {
+            if (followingTail && rows.isNotEmpty()) {
+                listState.scrollToItem(rows.size - 1)
+            }
         }
-        Box(modifier = modifier.fillMaxWidth()) {
+        LaunchedEffect(listState.isScrollInProgress) {
+            if (!listState.isScrollInProgress && listState.canScrollBackward) {
+                val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                followingTail = lastVisible >= rows.size - 1
+            }
+        }
+        // .scroll: padding 16px calc(clearance+16px) — the transcript sits 16px
+        // further in than the composer card's 32px clearance.
+        Column(modifier = modifier.fillMaxWidth().padding(horizontal = Width.composerSideClearance + 16.dp)) {
             if (rows.isEmpty()) {
                 Text(
                     "No messages yet. Set the API key in settings, then send a message.",
-                    modifier = Modifier.align(Alignment.Center).padding(24.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 96.dp),
                     color = dsw.textTertiary,
                     fontSize = dsw.textSize,
                 )
@@ -293,16 +324,25 @@ class ChatActivity : ComponentActivity() {
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(FlowGap),
                 ) {
-                    items(rows) { row ->
-                        when (row) {
-                            is ChatRow.User -> Bubble(row.text, user = true)
-                            is ChatRow.Assistant -> Bubble(row.text, user = false)
-                            is ChatRow.AssistantWithTools -> AssistantToolRow(row)
-                            is ChatRow.ToolCall -> ToolCard(row.name, row.arguments, pending = true)
-                            is ChatRow.ToolResult -> ToolCard(row.name, row.output, pending = false, error = row.error)
-                            is ChatRow.Error -> Bubble("error: " + row.text, user = false, error = true)
+                    itemsIndexed(rows) { index, row ->
+                        // Per-row spacing overrides from the flow-gap contract.
+                        val topGap = when {
+                            index == 0 -> 0.dp
+                            rows[index - 1] is ChatRow.ToolResult && row is ChatRow.Assistant -> ResponseGap
+                            rows[index - 1] is ChatRow.Assistant -> ResponseGap
+                            else -> FlowGap
+                        }
+                        Box(Modifier.padding(top = if (index == 0) 16.dp else topGap)) {
+                            when (row) {
+                                is ChatRow.User -> UserBubble(row.text)
+                                is ChatRow.Assistant -> AssistantText(row.text)
+                                is ChatRow.AssistantWithTools -> AssistantWithTools(row)
+                                is ChatRow.ToolCall -> ProcessRow(row.name, row.arguments, pending = true)
+                                is ChatRow.ToolResult -> ProcessRow(row.name, row.output, pending = false, error = row.error)
+                                is ChatRow.Error -> ErrorRow(row.text)
+                            }
                         }
                     }
                 }
@@ -310,155 +350,191 @@ class ChatActivity : ComponentActivity() {
         }
     }
 
-    /** One transcript bubble: right-aligned brand bubble for the user. */
+    /**
+     * The user message, MessageItem.module.css .userRow/.bubble: right
+     * aligned, deepseek-50 fill, radius-xl 20px, padding 10x16, capped at
+     * 70.2% of the column width.
+     */
     @Composable
-    private fun Bubble(text: String, user: Boolean, error: Boolean = false) {
-        val bg = when {
-            error -> dsw.diffDeleted
-            user -> dsw.buttonPrimaryFill
-            else -> dsw.bgLayer1
-        }
-        val fg = if (user) dsw.textInverted else dsw.textPrimary
-        Box(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+    private fun UserBubble(text: String) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = bg,
-                modifier = Modifier.widthIn(max = 320.dp)
-                    .align(if (user) Alignment.CenterEnd else Alignment.CenterStart),
+                shape = RoundedCornerShape(20.dp),
+                color = dsw.bubble,
+                modifier = Modifier.widthIn(max = 280.dp),
             ) {
                 Text(
                     text,
-                    color = fg,
+                    color = dsw.textPrimary,
                     fontSize = dsw.textSize,
-                    modifier = Modifier.padding(10.dp),
+                    lineHeight = 22.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
                 )
             }
         }
     }
 
-    /** Assistant message plus the tool names it asked to run. */
+    /** The assistant reply: no bubble — bare text on the column (AssistantMarkdown). */
     @Composable
-    private fun AssistantToolRow(row: ChatRow.AssistantWithTools) {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-            if (row.text.isNotEmpty()) {
-                Text(row.text, color = dsw.textPrimary, fontSize = dsw.textSize)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                row.toolNames.forEach { name -> ToolPill(name) }
-            }
-        }
+    private fun AssistantText(text: String) {
+        Text(
+            text,
+            color = dsw.textPrimary,
+            fontSize = dsw.textSize,
+            lineHeight = 22.sp,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 
+    /** Assistant text followed by the process rows its turn produced. */
     @Composable
-    private fun ToolPill(name: String) {
-        Surface(
-            shape = RoundedCornerShape(6.dp),
-            color = dsw.bgLayer2,
-        ) {
-            Text(
-                name,
-                color = dsw.textSecondary,
-                fontSize = dsw.labelSize,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-            )
+    private fun AssistantWithTools(row: ChatRow.AssistantWithTools) {
+        Column {
+            if (row.text.isNotEmpty()) AssistantText(row.text)
         }
     }
 
     /**
-     * A tool card, the DisclosureRow shape: header row with the tool name,
-     * expandable monospace body for arguments or output.
+     * The tool process row (TurnProcessNodeView .root): NOT a card — a 33px
+     * disclosure line with a 0.5px bottom border in border-l2, tertiary
+     * label, chevron that flips when open.
      */
     @Composable
-    private fun ToolCard(name: String, body: String, pending: Boolean, error: String = "") {
+    private fun ProcessRow(name: String, body: String, pending: Boolean, error: String = "") {
         var expanded by remember { mutableStateOf(false) }
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-                .background(dsw.bgLayer1, RoundedCornerShape(12.dp))
-                .border(1.dp, dsw.borderL1, RoundedCornerShape(12.dp)),
-        ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth()
+                    .heightIn(min = 33.dp)
+                    .border(0.5.dp, dsw.borderL2, RectangleShape)
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 4.dp),
             ) {
                 Text(
+                    if (expanded) "▾" else "▸",
+                    color = dsw.textTertiary,
+                    fontSize = dsw.textSize,
+                )
+                Text(
                     name,
-                    color = dsw.textPrimary,
-                    fontSize = dsw.labelSize,
-                    fontFamily = FontFamily.Monospace,
+                    color = if (error.isNotEmpty()) dsw.danger else dsw.textTertiary,
+                    fontSize = dsw.textSize,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
                 Text(
                     when {
                         error.isNotEmpty() -> "error"
-                        pending -> "running"
-                        else -> "done"
+                        pending -> "…"
+                        else -> ""
                     },
                     color = if (error.isNotEmpty()) dsw.danger else dsw.textTertiary,
-                    fontSize = dsw.labelSize,
+                    fontSize = dsw.textSize,
                 )
             }
-            if (expanded) {
+            if (expanded && body.isNotEmpty()) {
                 Text(
                     body,
                     color = dsw.textSecondary,
                     fontSize = dsw.codeSize,
                     fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(horizontal = 10.dp).padding(bottom = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp, start = 20.dp),
                 )
             }
-            Text(
-                if (expanded) "▾ hide" else "▸ show",
-                color = dsw.textTertiary,
-                fontSize = dsw.labelSize,
-                modifier = Modifier
-                    .padding(horizontal = 10.dp)
-                    .padding(bottom = 8.dp),
-            )
         }
-        // Toggle needs to be clickable; keep the simple gesture surface.
-        Box(Modifier.padding(horizontal = 12.dp)) {}
     }
 
     @Composable
+    private fun ErrorRow(text: String) {
+        Text(
+            text,
+            color = dsw.danger,
+            fontSize = dsw.textSize,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+
+    /** The to-bottom float (ChatView .toBottom): a 34px round button. */
+    @Composable
+    private fun ToBottomButton(onClick: () -> Unit) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Surface(
+                shape = RoundedCornerShape(100.dp),
+                color = dsw.bgLayer1,
+                shadowElevation = 2.dp,
+                modifier = Modifier.align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 16.dp)
+                    .size(34.dp)
+                    .clickable(onClick = onClick),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text("↓", color = dsw.textPrimary, fontSize = dsw.textSize)
+                }
+            }
+        }
+    }
+
+    /**
+     * The composer card (InputBar.module.css .card): radius-panel 28px,
+     * fill specific-input-major, hairline stroke border-l2 with the soft
+     * elevation, 8px top pad, 12px gap between text area and button row,
+     * side clearance 32px.
+     */
+    @Composable
     private fun Composer() {
         var text by remember { mutableStateOf("") }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = Width.composerSideClearance * 2, vertical = 4.dp),
         ) {
-            TextField(
-                value = text,
-                onValueChange = { text = it },
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message", color = dsw.textTertiary, fontSize = dsw.textSize) },
-                maxLines = 5,
-                shape = RoundedCornerShape(12.dp),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = dsw.bgLayer1,
-                    unfocusedContainerColor = dsw.bgLayer1,
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                    cursorColor = dsw.brandPrimary,
-                    focusedTextColor = dsw.textPrimary,
-                    unfocusedTextColor = dsw.textPrimary,
-                ),
-            )
-            Button(
-                onClick = {
-                    send(text)
-                    text = ""
-                },
-                enabled = text.isNotBlank() && !turnRunning,
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = dsw.buttonPrimaryFill,
-                    contentColor = dsw.textInverted,
-                    disabledContainerColor = dsw.bgLayer2,
-                    disabledContentColor = dsw.textTertiary,
-                ),
+            Column(
+                modifier = Modifier.fillMaxWidth()
+                    .background(dsw.inputMajor, RoundedCornerShape(28.dp))
+                    .border(0.5.dp, dsw.borderL2, RoundedCornerShape(28.dp))
+                    .padding(top = 8.dp, bottom = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(if (turnRunning) "…" else "Send", fontSize = dsw.textSize)
+                TextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    placeholder = { Text("Message", color = dsw.textTertiary, fontSize = dsw.textSize) },
+                    maxLines = 5,
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        cursorColor = dsw.brandPrimary,
+                        focusedTextColor = dsw.textPrimary,
+                        unfocusedTextColor = dsw.textPrimary,
+                    ),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    Button(
+                        onClick = {
+                            send(text)
+                            text = ""
+                        },
+                        enabled = text.isNotBlank() && !turnRunning,
+                        shape = RoundedCornerShape(100.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 20.dp, vertical = 6.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = dsw.buttonPrimaryFill,
+                            contentColor = dsw.textInverted,
+                            disabledContainerColor = dsw.bgLayer2,
+                            disabledContentColor = dsw.textTertiary,
+                        ),
+                    ) {
+                        Text(if (turnRunning) "…" else "Send", fontSize = dsw.textSize)
+                    }
+                }
             }
         }
     }

@@ -35,6 +35,12 @@ data class Dsw(
     val textInverted: Color,
     val diffAdded: Color,
     val diffDeleted: Color,
+    // --dsw-specific-bubble: the user bubble fill. Light binds deepseek-50,
+    // dark binds bluish-850 (design-platform.css:268/386).
+    val bubble: Color,
+    // --dsw-specific-input-major: the composer card fill. Light bluish-00,
+    // dark bluish-850 (269/387).
+    val inputMajor: Color,
     val buttonPrimaryFill: Color,
     val buttonPrimaryHover: Color,
     val buttonGhostActiveFill: Color,
@@ -74,6 +80,10 @@ val DswLight = Dsw(
     buttonPrimaryHover = Color(0xFF2551A8),
     buttonGhostActiveFill = Color(0xFFEDEDED),
     danger = Color(0xFFEC1313),
+    // deepseek-50 rgb(237,243,254)
+    bubble = Color(0xFFEDF3FE),
+    // bluish-00
+    inputMajor = Color(0xFFFFFFFF),
 )
 
 /** The dark theme: the token values the official dark build ships. */
@@ -98,6 +108,9 @@ val DswDark = DswLight.copy(
     buttonPrimaryFill = Color(0xFF4176E6),
     buttonPrimaryHover = Color(0xFF5686FE),
     buttonGhostActiveFill = Color(0xFF292929),
+    // bluish-850 rgb(44,44,46)
+    bubble = Color(0xFF2C2C2E),
+    inputMajor = Color(0xFF2C2C2E),
 )
 
 /**
@@ -120,7 +133,12 @@ data class DswType(
  */
 @Immutable
 data class DswShape(
-    val controlMd: Int = 12,
-    val controlSm: Int = 8,
-    val card: Int = 12,
+    // The official radius ladder (base.css:19-24).
+    val xs: Int = 4,
+    val sm: Int = 8,
+    val md: Int = 12,
+    val lg: Int = 16,
+    val xl: Int = 20,
+    // Panels and the composer card (base.css:23).
+    val panel: Int = 28,
 )
