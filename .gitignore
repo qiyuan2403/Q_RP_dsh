@@ -9,10 +9,21 @@
 go.work
 go.work.sum
 
-# Local workspace data (card workspaces, session logs)
-/workspace/
+# Session logs written beside the executable during local runs.
+#
+# NOTE: no `/workspace/` rule. `workspace/` is a SOURCE PACKAGE in this
+# repository, and ignoring it silently excluded the package from every commit.
 /sessions/
 *.local.*
+
+# Android build output and signing material.
+#
+# The keystore is a DEBUG key: it must never be committed, and a release key
+# must never be reused from a working tree.
+/android/build/
+/android/keys/
+/android/jni/libqrpdsh.so
+/android/jni/libqrpdsh.h
 
 # OS
 .DS_Store
