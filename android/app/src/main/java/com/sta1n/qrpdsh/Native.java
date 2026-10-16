@@ -50,4 +50,14 @@ public final class Native {
     public static native String runTurn(String task, String home, String workDir,
                                         String baseUrl, String apiKey, String model,
                                         String nodePath);
+
+    /**
+     * Opens (or resumes) the newest session under {@code home} and returns a
+     * JSON document: {@code {"id": "...", "events": [...]}}. The events are
+     * the conversation recorded so far, for the UI to replay.
+     */
+    public static native String openSession(String home);
+
+    /** Closes one session, flushing its log to disk. */
+    public static native void closeSession(String id);
 }

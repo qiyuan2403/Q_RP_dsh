@@ -440,3 +440,19 @@ func writeFileSync(path string, data []byte) error {
 
 // Discard drains a reader, used where a body must be consumed but not kept.
 func Discard(r io.Reader) { _, _ = io.Copy(io.Discard, r) }
+
+// Events returns every event recorded so far. It flushes the write buffer
+// first: an appended event that still sits in the buffer IS recorded — the
+// live view must agree with the file, and a reader that misses the tail
+// would render a conversation the log says happened.
+func (l *Log) Events() ([]Event, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return readEvents(filepath.Join(l.path, LogFilename))
+	}
+	if err := l.writer.Flush(); err != nil {
+		return nil, err
+	}
+	return readEvents(filepath.Join(l.path, LogFilename))
+}

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/qiyuan2403/Q_RP_dsh/agent"
@@ -206,3 +207,11 @@ func buildPrompt(registry *tools.Registry) (*systemprompt.Assembly, error) {
 
 // main is required by c-shared even though the library is never executed.
 func main() {}
+
+// sessions holds the open session logs, keyed by session id. A turn runs
+// against its session so a UI can continue a conversation across turns and
+// subscribe to its events; the map is the JNI-side state those calls need.
+var (
+	sessionsMu sync.Mutex
+	sessions   = map[string]*session.Log{}
+)

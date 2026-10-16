@@ -41,6 +41,15 @@ import "C"
 
 import "unsafe"
 
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/qiyuan2403/Q_RP_dsh/session"
+)
+
 //export Java_com_sta1n_qrpdsh_Native_version
 func Java_com_sta1n_qrpdsh_Native_version(env *C.JNIEnv, clazz C.jclass) C.jstring {
 	return C.jni_string(env, C.CString(Version))
@@ -72,4 +81,70 @@ func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, h
 	}
 	out := runTurnJSON(req)
 	return C.jni_string(env, C.CString(out))
+}
+
+// openSessionNativeJSON opens (creating if needed) a session under home and
+// remembers it. The response carries the session id and the full event
+// history — the UI replays it to render the conversation it is resuming.
+//
+//export Java_com_sta1n_qrpdsh_Native_openSession
+func Java_com_sta1n_qrpdsh_Native_openSession(env *C.JNIEnv, clazz C.jclass, home C.jstring) C.jstring {
+	cHome := C.jni_cstr(env, home)
+	goHome := C.GoString(cHome)
+	defer C.free(unsafe.Pointer(cHome))
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	// Reuse the newest existing session under home: the mobile client is
+	// single-conversation, so "open" means "resume where we left off".
+	entries, err := os.ReadDir(filepath.Join(goHome, "sessions"))
+	if err == nil && len(entries) > 0 {
+		// ReadDir is sorted by name; session ids are time-ordered ULIDs, so
+		// the last entry is the newest.
+		for i := len(entries) - 1; i >= 0; i-- {
+			name := entries[i].Name()
+			if log, err := session.Open(filepath.Join(goHome, "sessions", name)); err == nil {
+				sessions[name] = log
+				return C.jni_string(env, C.CString(sessionJSON(log, name)))
+			}
+		}
+	}
+
+	id := session.NewID()
+	log, err := session.Create(filepath.Join(goHome, "sessions", id), session.Header{
+		ID:        id,
+		CreatedAt: time.Now().UnixMilli(),
+		CWD:       goHome,
+	})
+	if err != nil {
+		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+	}
+	sessions[id] = log
+	return C.jni_string(env, C.CString(sessionJSON(log, id)))
+}
+
+// sessionJSON renders the id plus every recorded event for the UI replay.
+func sessionJSON(log *session.Log, id string) string {
+	events, _ := log.Events()
+	raw, err := json.Marshal(map[string]any{"id": id, "events": events})
+	if err != nil {
+		return `{"id":"` + id + `","events":[]}`
+	}
+	return string(raw)
+}
+
+// closeSessionNative closes and forgets one session.
+//
+//export Java_com_sta1n_qrpdsh_Native_closeSession
+func Java_com_sta1n_qrpdsh_Native_closeSession(env *C.JNIEnv, clazz C.jclass, id C.jstring) {
+	cID := C.jni_cstr(env, id)
+	goID := C.GoString(cID)
+	defer C.free(unsafe.Pointer(cID))
+	sessionsMu.Lock()
+	log, ok := sessions[goID]
+	delete(sessions, goID)
+	sessionsMu.Unlock()
+	if ok {
+		_ = log.Close()
+	}
 }
