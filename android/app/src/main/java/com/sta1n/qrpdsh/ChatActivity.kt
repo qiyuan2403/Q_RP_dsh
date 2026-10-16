@@ -85,7 +85,7 @@ class ChatActivity : ComponentActivity() {
             }
             sessionId = obj.getString("id")
             rows.clear()
-            val events = obj.getJSONArray("events")
+            val events = obj.optJSONArray("events") ?: JSONArray()
             for (i in 0 until events.length()) {
                 rows.add(project(events.getJSONObject(i)))
             }

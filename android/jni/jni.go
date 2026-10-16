@@ -126,7 +126,13 @@ func Java_com_sta1n_qrpdsh_Native_openSession(env *C.JNIEnv, clazz C.jclass, hom
 
 // sessionJSON renders the id plus every recorded event for the UI replay.
 func sessionJSON(log *session.Log, id string) string {
-	events, _ := log.Events()
+	events, err := log.Events()
+	if events == nil {
+		events = []session.Event{}
+	}
+	if err != nil {
+		return `{"id":"` + id + `","error":"` + err.Error() + `"}`
+	}
 	raw, err := json.Marshal(map[string]any{"id": id, "events": events})
 	if err != nil {
 		return `{"id":"` + id + `","events":[]}`
