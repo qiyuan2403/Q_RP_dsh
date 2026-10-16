@@ -25,6 +25,7 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/session"
 	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
+	builtintools "github.com/qiyuan2403/Q_RP_dsh/tools/builtin"
 	"github.com/qiyuan2403/Y_Cordis/jsbridge"
 	"github.com/qiyuan2403/Y_Cordis/workspace"
 )
@@ -44,6 +45,8 @@ func run() int {
 		model       = fs.String("model", os.Getenv("Q_RP_DSH_MODEL"), "model id (env Q_RP_DSH_MODEL)")
 		persona     = fs.String("persona", "", "deployment persona for the system prompt")
 		maxSteps    = fs.Int("max-steps", 32, "maximum model calls in one turn")
+		workDir     = fs.String("workdir", "", "working directory the file tools are bounded by (defaults to the process's)")
+		allowShell  = fs.Bool("allow-shell", false, "offer the bash tool (runs commands in the working directory)")
 		timeout     = fs.Duration("timeout", 10*time.Minute, "overall turn timeout")
 		showPrompt  = fs.Bool("print-prompt", false, "print the assembled system prompt and exit")
 		listProfile = fs.Bool("list-profile", false, "compose the profile, print its rows, and exit")
@@ -90,16 +93,18 @@ examples:
 	}
 
 	return runTurn(runConfig{
-		home:     *home,
-		profile:  *profilePath,
-		anchor:   *anchor,
-		baseURL:  *baseURL,
-		apiKey:   *apiKey,
-		model:    *model,
-		persona:  *persona,
-		maxSteps: *maxSteps,
-		timeout:  *timeout,
-		task:     task,
+		home:       *home,
+		profile:    *profilePath,
+		anchor:     *anchor,
+		baseURL:    *baseURL,
+		apiKey:     *apiKey,
+		model:      *model,
+		persona:    *persona,
+		maxSteps:   *maxSteps,
+		timeout:    *timeout,
+		workDir:    *workDir,
+		allowShell: *allowShell,
+		task:       task,
 	})
 }
 
@@ -107,8 +112,10 @@ type runConfig struct {
 	home, profile, anchor string
 	baseURL, apiKey       string
 	model, persona, task  string
+	workDir               string
 	maxSteps              int
 	timeout               time.Duration
+	allowShell            bool
 }
 
 // resolveHome picks the harness home.
@@ -128,12 +135,14 @@ func resolveHome(override string) (string, error) {
 
 // buildRegistry returns the tools available to a turn.
 //
-// The set is deliberately small and honest: the harness core owns the loop, the
-// session log, and the provider, and a tool that is not registered here simply
-// is not offered to the model. Tools arrive from plugins; until those are
-// loaded, the model gets none rather than a placeholder that cannot run.
-func buildRegistry() *tools.Registry {
-	return tools.NewRegistry()
+// Every tool is bounded by `root`, so a model mistake cannot reach outside the
+// directory the harness was pointed at.
+func buildRegistry(root string, allowShell bool) (*tools.Registry, error) {
+	r := tools.NewRegistry()
+	if err := builtintools.Register(r, builtintools.Options{Root: root, AllowShell: allowShell}); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // assemblePrompt builds the system prompt for one deployment.
@@ -245,7 +254,15 @@ func runTurn(cfg runConfig) int {
 	}
 	defer log.Close()
 
-	registry := buildRegistry()
+	workRoot := cfg.workDir
+	if workRoot == "" {
+		workRoot, _ = os.Getwd()
+	}
+	registry, err := buildRegistry(workRoot, cfg.allowShell)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
+		return 1
+	}
 	provider := openaichat.New(openaichat.Config{
 		BaseURL: cfg.baseURL,
 		APIKey:  cfg.apiKey,

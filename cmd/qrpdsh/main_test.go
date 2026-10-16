@@ -87,11 +87,36 @@ func TestListProfileReportsCompositionErrors(t *testing.T) {
 	}
 }
 
-// TestBuildRegistryStartsEmpty pins that no placeholder tools are offered: a
-// tool that cannot run must not be advertised to the model.
-func TestBuildRegistryStartsEmpty(t *testing.T) {
-	r := buildRegistry()
-	if names := r.Names(); len(names) != 0 {
-		t.Fatalf("registry = %v, want no tools until plugins register them", names)
+// TestBuildRegistryOffersTheFileTools pins the default set: file access without
+// command execution.
+func TestBuildRegistryOffersTheFileTools(t *testing.T) {
+	r, err := buildRegistry(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("buildRegistry: %v", err)
+	}
+	got := r.Names()
+	want := []string{"edit", "list", "read", "write"}
+	if len(got) != len(want) {
+		t.Fatalf("tools = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+	}
+	if _, ok := r.Lookup("bash"); ok {
+		t.Fatal("the shell tool was offered without -allow-shell")
+	}
+}
+
+// TestBuildRegistryOffersShellOnlyWhenAllowed pins the separate switch: a
+// deployment may want file access without command execution.
+func TestBuildRegistryOffersShellOnlyWhenAllowed(t *testing.T) {
+	r, err := buildRegistry(t.TempDir(), true)
+	if err != nil {
+		t.Fatalf("buildRegistry: %v", err)
+	}
+	if _, ok := r.Lookup("bash"); !ok {
+		t.Fatalf("the shell tool is missing from %v", r.Names())
 	}
 }
