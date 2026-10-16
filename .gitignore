@@ -33,3 +33,12 @@ Thumbs.db
 # too large and too regenerable to commit.
 /android/jni/libnodebin.so
 /android/app/src/main/assets/nodebundle_libs.tgz
+
+# Gradle build caches
+/android/.gradle/
+/android/app/build/
+/android/build/
+/android/local.properties
+local.properties
+android/app/src/main/jniLibs/arm64-v8a/
+/android/app/src/main/jniLibs/arm64-v8a/
