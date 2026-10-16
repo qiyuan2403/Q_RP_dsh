@@ -24,11 +24,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"/{compiled,dex,apk}
 
 echo "==> 1/7 building the Go shared library (arm64)"
-(
-	cd jni
-	CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC" \
-		go build -buildmode=c-shared -o libqrpdsh.so .
-)
+./jni/build.sh
 
 echo "==> 2/7 compiling Java"
 javac -source 8 -target 8 -bootclasspath "$PLATFORM" \

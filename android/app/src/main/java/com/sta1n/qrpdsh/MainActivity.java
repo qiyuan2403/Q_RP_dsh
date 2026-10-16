@@ -25,13 +25,17 @@ public class MainActivity extends Activity {
         report.append("filesDir:\n").append(getFilesDir().getAbsolutePath()).append("\n\n");
 
         if (Native.isLoaded()) {
+            report.append("Go harness: loaded\n");
+            Log.i(TAG, "about to call Native.version()");
             String version;
             try {
                 version = Native.version();
+                Log.i(TAG, "Native.version() returned: " + version);
             } catch (Throwable t) {
                 version = "call failed: " + t;
+                Log.e(TAG, "Native.version() threw", t);
             }
-            report.append("Go harness: loaded\nversion: ").append(version).append("\n");
+            report.append("version: ").append(version).append("\n");
         } else {
             report.append("Go harness: NOT loaded\n").append(Native.loadError()).append("\n");
         }

@@ -9,6 +9,38 @@ package main
 
 /*
 #include <stdlib.h>
+#include <string.h>
+#include <jni.h>
+
+// A JNI method returning a Java String must return a jstring — a Java object
+// reference — not a C char pointer. The JVM treats the return value as an
+// object and hands it to the caller as such, so returning a `char*` makes ART
+// dereference a data address as if it were a heap object.
+//
+// These helpers go through the JNIEnv function table, which is how a native
+// method creates a Java string.
+static jstring jni_string(JNIEnv *env, const char *utf8) {
+	return (*env)->NewStringUTF(env, utf8);
+}
+
+// jni_cstr copies a Java String into a C string the caller must free.
+// A null reference maps to an empty string so the Go side never sees a nil.
+static char *jni_cstr(JNIEnv *env, jstring s) {
+	if (s == NULL) {
+		char *empty = (char *)malloc(1);
+		if (empty != NULL) empty[0] = 0;
+		return empty;
+	}
+	const char *utf = (*env)->GetStringUTFChars(env, s, NULL);
+	if (utf == NULL) {
+		char *empty = (char *)malloc(1);
+		if (empty != NULL) empty[0] = 0;
+		return empty;
+	}
+	char *copy = strdup(utf);
+	(*env)->ReleaseStringUTFChars(env, s, utf);
+	return copy;
+}
 */
 import "C"
 
@@ -31,8 +63,8 @@ import (
 const Version = "0.0.1"
 
 //export Java_com_sta1n_qrpdsh_Native_version
-func Java_com_sta1n_qrpdsh_Native_version(env, clazz unsafe.Pointer) *C.char {
-	return C.CString(Version)
+func Java_com_sta1n_qrpdsh_Native_version(env *C.JNIEnv, clazz C.jclass) C.jstring {
+	return C.jni_string(env, C.CString(Version))
 }
 
 // runRequest is the JSON the app sends for one turn.
@@ -55,15 +87,31 @@ type runResponse struct {
 }
 
 //export Java_com_sta1n_qrpdsh_Native_runTurn
-func Java_com_sta1n_qrpdsh_Native_runTurn(env, clazz unsafe.Pointer, task, workDir, baseURL, apiKey, model *C.char) *C.char {
+func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, workDir, baseURL, apiKey, model C.jstring) C.jstring {
+	// Each Java String is copied out before use: the JNI reference is only
+	// valid while the JVM keeps it alive, so the Go side must not retain it.
+	t := C.jni_cstr(env, task)
+	w := C.jni_cstr(env, workDir)
+	b := C.jni_cstr(env, baseURL)
+	k := C.jni_cstr(env, apiKey)
+	m := C.jni_cstr(env, model)
+	defer func() {
+		C.free(unsafe.Pointer(t))
+		C.free(unsafe.Pointer(w))
+		C.free(unsafe.Pointer(b))
+		C.free(unsafe.Pointer(k))
+		C.free(unsafe.Pointer(m))
+	}()
+
 	req := runRequest{
-		Task:    C.GoString(task),
-		WorkDir: C.GoString(workDir),
-		BaseURL: C.GoString(baseURL),
-		APIKey:  C.GoString(apiKey),
-		Model:   C.GoString(model),
+		Task:    C.GoString(t),
+		WorkDir: C.GoString(w),
+		BaseURL: C.GoString(b),
+		APIKey:  C.GoString(k),
+		Model:   C.GoString(m),
 	}
-	return C.CString(runTurnJSON(req))
+	out := runTurnJSON(req)
+	return C.jni_string(env, C.CString(out))
 }
 
 // runTurnJSON performs one turn and returns its result as JSON.
