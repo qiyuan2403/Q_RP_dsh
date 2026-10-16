@@ -3,9 +3,9 @@ package com.sta1n.qrpdsh;
 /**
  * The bridge to the Go harness.
  *
- * The harness is compiled as a shared library and loaded here. It is not called
- * yet: this class exists so the loading path is exercised, which is what proves
- * the library was packaged correctly and the ABI matches.
+ * The harness is compiled as a shared library and loaded here. It runs the
+ * whole turn on the calling thread, so callers MUST NOT call it from the UI
+ * thread: a turn performs network I/O and can run for minutes.
  */
 public final class Native {
     private static boolean loaded;
@@ -32,6 +32,22 @@ public final class Native {
     /** Returns the harness version string reported by the Go side. */
     public static native String version();
 
-    /** Runs one harness turn with the given task and returns its output. */
-    public static native String runTurn(String task, String workDir, String baseUrl, String apiKey, String model);
+    /**
+     * Runs one harness turn and returns its result as JSON.
+     *
+     * <p>{@code home} is the directory the harness owns: session logs and the
+     * default working directory live under it. It must be a path the app can
+     * write, which on Android means its private files directory — the harness
+     * cannot derive that itself, and /tmp is not writable by an app.
+     *
+     * <p>{@code nodePath} is the embedded node executable extracted by
+     * {@link NodeRuntime}, or {@code null} when the runtime is unavailable.
+     * A null path disables the JS layer for the turn: config expressions are
+     * refused and npm plugins stay dormant. The harness runs without it.
+     *
+     * <p>Blocking. Call from a worker thread.
+     */
+    public static native String runTurn(String task, String home, String workDir,
+                                        String baseUrl, String apiKey, String model,
+                                        String nodePath);
 }

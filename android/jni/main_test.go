@@ -13,6 +13,23 @@ func TestVersionIsReported(t *testing.T) {
 	}
 }
 
+// TestRunTurnRequiresHome pins that the app must supply a writable directory.
+// The harness cannot derive one: on Android the only writable path is the
+// app's private directory, and /tmp belongs to the shell user.
+func TestRunTurnRequiresHome(t *testing.T) {
+	var resp runResponse
+	out := runTurnJSON(runRequest{Task: "hi", BaseURL: "http://x", Model: "m"})
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if resp.OK {
+		t.Fatal("a turn without home was accepted")
+	}
+	if !strings.Contains(resp.Error, "home") {
+		t.Fatalf("error = %q, want it to name home", resp.Error)
+	}
+}
+
 // TestRunTurnRejectsAnEmptyTask pins fail-loud before any network call.
 func TestRunTurnRejectsAnEmptyTask(t *testing.T) {
 	var resp runResponse

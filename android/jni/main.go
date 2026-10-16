@@ -2,54 +2,22 @@
 //
 // The JNI entry points are exported from Go: the app calls
 // `com.sta1n.qrpdsh.Native.version()` and `runTurn(...)`, which the JVM resolves
-// to the symbols below. Names follow the JNI convention exactly —
+// to the symbols in jni.go. Names follow the JNI convention exactly —
 // `Java_<package with underscores>_<class>_<method>` — because the JVM looks
 // them up by name rather than through a registration call.
-package main
-
-/*
-#include <stdlib.h>
-#include <string.h>
-#include <jni.h>
-
-// A JNI method returning a Java String must return a jstring — a Java object
-// reference — not a C char pointer. The JVM treats the return value as an
-// object and hands it to the caller as such, so returning a `char*` makes ART
-// dereference a data address as if it were a heap object.
 //
-// These helpers go through the JNIEnv function table, which is how a native
-// method creates a Java string.
-static jstring jni_string(JNIEnv *env, const char *utf8) {
-	return (*env)->NewStringUTF(env, utf8);
-}
-
-// jni_cstr copies a Java String into a C string the caller must free.
-// A null reference maps to an empty string so the Go side never sees a nil.
-static char *jni_cstr(JNIEnv *env, jstring s) {
-	if (s == NULL) {
-		char *empty = (char *)malloc(1);
-		if (empty != NULL) empty[0] = 0;
-		return empty;
-	}
-	const char *utf = (*env)->GetStringUTFChars(env, s, NULL);
-	if (utf == NULL) {
-		char *empty = (char *)malloc(1);
-		if (empty != NULL) empty[0] = 0;
-		return empty;
-	}
-	char *copy = strdup(utf);
-	(*env)->ReleaseStringUTFChars(env, s, utf);
-	return copy;
-}
-*/
-import "C"
+// Everything that is not the JNI wrapper lives here, in a file with no cgo, so
+// the turn logic compiles and its tests run on the build host. jni.go is gated
+// on GOOS=android, which is an implicit build constraint, so a host build never
+// needs jni.h.
+package main
 
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/qiyuan2403/Q_RP_dsh/agent"
 	"github.com/qiyuan2403/Q_RP_dsh/llm/openaichat"
@@ -57,15 +25,12 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
 	builtintools "github.com/qiyuan2403/Q_RP_dsh/tools/builtin"
+	"github.com/qiyuan2403/Y_Cordis/jsbridge"
+	"github.com/qiyuan2403/Y_Cordis/loader"
 )
 
 // Version is the harness version reported to the app.
 const Version = "0.0.1"
-
-//export Java_com_sta1n_qrpdsh_Native_version
-func Java_com_sta1n_qrpdsh_Native_version(env *C.JNIEnv, clazz C.jclass) C.jstring {
-	return C.jni_string(env, C.CString(Version))
-}
 
 // runRequest is the JSON the app sends for one turn.
 type runRequest struct {
@@ -75,6 +40,10 @@ type runRequest struct {
 	APIKey  string `json:"apiKey"`
 	Model   string `json:"model"`
 	Home    string `json:"home"`
+	// NodePath is the embedded node executable extracted by the app
+	// (NodeRuntime). Empty means the JS layer is unavailable: !!js
+	// expressions fail loudly and npm plugins stay dormant.
+	NodePath string `json:"nodePath,omitempty"`
 }
 
 // runResponse is the JSON returned to the app.
@@ -84,34 +53,6 @@ type runResponse struct {
 	Reason string `json:"reason,omitempty"`
 	Steps  int    `json:"steps,omitempty"`
 	Error  string `json:"error,omitempty"`
-}
-
-//export Java_com_sta1n_qrpdsh_Native_runTurn
-func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, workDir, baseURL, apiKey, model C.jstring) C.jstring {
-	// Each Java String is copied out before use: the JNI reference is only
-	// valid while the JVM keeps it alive, so the Go side must not retain it.
-	t := C.jni_cstr(env, task)
-	w := C.jni_cstr(env, workDir)
-	b := C.jni_cstr(env, baseURL)
-	k := C.jni_cstr(env, apiKey)
-	m := C.jni_cstr(env, model)
-	defer func() {
-		C.free(unsafe.Pointer(t))
-		C.free(unsafe.Pointer(w))
-		C.free(unsafe.Pointer(b))
-		C.free(unsafe.Pointer(k))
-		C.free(unsafe.Pointer(m))
-	}()
-
-	req := runRequest{
-		Task:    C.GoString(t),
-		WorkDir: C.GoString(w),
-		BaseURL: C.GoString(b),
-		APIKey:  C.GoString(k),
-		Model:   C.GoString(m),
-	}
-	out := runTurnJSON(req)
-	return C.jni_string(env, C.CString(out))
 }
 
 // runTurnJSON performs one turn and returns its result as JSON.
@@ -134,21 +75,69 @@ func runTurnJSON(req runRequest) string {
 		return encode(runResponse{Error: "baseUrl and model are required"})
 	}
 
-	home := req.Home
+	// The home directory is the app's own writable path. It has no default:
+	// guessing one is how a turn fails at its first write, and on Android
+	// there is no path an app may assume (/tmp belongs to the shell user).
+	home := strings.TrimSpace(req.Home)
 	if home == "" {
-		home = "/tmp/qrpdsh"
+		return encode(runResponse{Error: "home is required"})
 	}
-	workDir := req.WorkDir
+	workDir := strings.TrimSpace(req.WorkDir)
 	if workDir == "" {
 		workDir = home
 	}
 
+	// The embedded node powers the JS layer (!!js evaluation and npm
+	// plugins). Its dynamic libraries live beside the binary, so the child
+	// env must carry them via LD_LIBRARY_PATH — jsbridge passes Config.Env
+	// through to the spawn.
+	//
+	// The pool lives for this turn and closes with it: a pool holds node
+	// child processes, and the app may run turns hours apart, so keeping
+	// workers warm between turns pins RSS for nothing.
+	//
+	// A failure here is degraded, not broken: the turn proceeds without a
+	// JS layer and every !!js expression is refused loudly.
+	if req.NodePath != "" {
+		binDir := filepath.Dir(req.NodePath)
+		libDir := filepath.Join(binDir, "..", "lib")
+		conf := filepath.Join(binDir, "..", "etc", "tls", "openssl.cnf")
+		pool, poolErr := jsbridge.NewPool(jsbridge.Config{
+			Node:     req.NodePath,
+			ExecRoot: home,
+			Env: map[string]string{
+				"LD_LIBRARY_PATH": libDir,
+				// Termux's node build reads an OpenSSL config at startup;
+				// without this it aborts before main().
+				"OPENSSL_CONF": conf,
+			},
+		})
+		if poolErr != nil {
+			// No evaluator this turn: the mount's refusal is the contract.
+			_ = poolErr
+		} else {
+			defer pool.Close()
+			// Probe the runtime once. NewPool spawns workers lazily, so a
+			// broken install (missing libs) surfaces only at first use; one
+			// trivial evaluation settles it now, while the failure can still
+			// be reported as a turn-level fact.
+			probeCtx, cancelProbe := context.WithTimeout(context.Background(), 15*time.Second)
+			_, probeErr := (&jsbridge.Evaluator{Pool: pool}).Eval(probeCtx, "1 + 1", &loader.EvalScope{
+				Platform: "android",
+				Home:     home,
+			})
+			cancelProbe()
+			if probeErr != nil {
+				return encode(runResponse{Error: "embedded node probe failed: " + probeErr.Error()})
+			}
+		}
+	}
 	registry := tools.NewRegistry()
 	if err := builtintools.Register(registry, builtintools.Options{Root: workDir, AllowShell: true}); err != nil {
 		return encode(runResponse{Error: err.Error()})
 	}
 
-	assembly, err := buildPrompt()
+	assembly, err := buildPrompt(registry)
 	if err != nil {
 		return encode(runResponse{Error: err.Error()})
 	}
@@ -196,13 +185,20 @@ func runTurnJSON(req runRequest) string {
 }
 
 // buildPrompt assembles the system prompt for the mobile deployment.
-func buildPrompt() (*systemprompt.Assembly, error) {
+func buildPrompt(registry *tools.Registry) (*systemprompt.Assembly, error) {
 	r := systemprompt.New()
 	if err := r.Section(systemprompt.Section{
 		Name:  "harness-identity",
 		Order: systemprompt.SectionOrders["HARNESS_IDENTITY"],
 		Text:  "You are an agent running on the Q_RP_dsh harness on Android.",
 	}); err != nil {
+		return nil, err
+	}
+	// Tool-owned prompt sections ride with the tool's registration, not a
+	// centrally maintained block: the official harness injects its bash
+	// guidance from the tool itself, so the guidance cannot drift from the
+	// tool that carries the behavior.
+	if err := builtintools.AttachPromptSections(r, registry); err != nil {
 		return nil, err
 	}
 	return r.Assemble(systemprompt.AssembleContext{})
