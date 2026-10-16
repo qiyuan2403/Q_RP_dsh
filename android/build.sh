@@ -40,6 +40,7 @@ echo "==> 4/7 compiling resources"
 echo "==> 5/7 linking resources"
 "$BT/aapt2" link -o "$OUT/apk/base.apk" -I "$PLATFORM" \
 	--manifest app/AndroidManifest.xml \
+	-A app/src/main/assets \
 	--min-sdk-version "$API" --target-sdk-version 34 "$OUT/res.zip"
 
 echo "==> 6/7 assembling"
@@ -48,8 +49,14 @@ cp base.apk app-unsigned.apk
 zip -q -j app-unsigned.apk ../dex/classes.dex
 mkdir -p lib/arm64-v8a
 cp ../../jni/libqrpdsh.so lib/arm64-v8a/
+# The embedded Node runtime rides in jniLibs as a disguised .so: Android only
+# extracts that directory, and the extracted path is executable by the app
+# (verified on corot and PHJ110). The 16KB-alignment rule does not apply to
+# this entry because the app dlopens nothing from it — it is execve'd.
+cp ../../jni/libnodebin.so lib/arm64-v8a/
 zip -q -r app-unsigned.apk lib
 cd ../..
+
 
 echo "==> 7/7 aligning and signing"
 "$BT/zipalign" -f -p 4 "$OUT/apk/app-unsigned.apk" "$OUT/apk/app-aligned.apk"

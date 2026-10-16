@@ -28,3 +28,8 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
+
+# Embedded Node runtime: assembled from Termux packages by android/nodebundle.sh,
+# too large and too regenerable to commit.
+/android/jni/libnodebin.so
+/android/app/src/main/assets/nodebundle_libs.tgz
