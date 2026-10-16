@@ -39,6 +39,13 @@ type Options struct {
 	// AllowShell enables the shell tool. It is a separate switch because a
 	// deployment may want file access without command execution.
 	AllowShell bool
+	// ProfileDir is the npm plugin profile the plugin_manager tool manages.
+	// Empty registers no plugin tool: without a profile there is nothing to
+	// manage.
+	ProfileDir string
+	// HostVersion is the harness version the plugin engine check runs
+	// against. Empty disables the engine check.
+	HostVersion string
 	// Interpreter is the shell executor the shell tool runs on. Zero means
 	// the platform default. Exactly one executor is mounted per registry:
 	// the official harness fails a duplicate mount loudly rather than
@@ -117,6 +124,11 @@ func Register(r *tools.Registry, opts Options) error {
 	}
 	if cfg.AllowShell {
 		if err := r.Register(shellTool(cfg)); err != nil {
+			return err
+		}
+	}
+	if cfg.ProfileDir != "" {
+		if err := r.Register(pluginManagerTool(cfg, cfg.HostVersion)); err != nil {
 			return err
 		}
 	}

@@ -263,6 +263,14 @@ func runTurn(cfg runConfig) int {
 		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
 		return 1
 	}
+	profileDir := filepath.Join(home, "plugins")
+	if err := builtintools.Register(registry, builtintools.Options{
+		Root:       workRoot,
+		ProfileDir: profileDir,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
+		return 1
+	}
 	provider := openaichat.New(openaichat.Config{
 		BaseURL: cfg.baseURL,
 		APIKey:  cfg.apiKey,
@@ -328,7 +336,10 @@ func mountProfile(profilePath, anchor, homeOverride string) int {
 	if caps := workspace.Probe(home); caps.Usable() && caps.Executable {
 		execRoot = home
 	}
-	pool, poolErr := jsbridge.NewPool(jsbridge.Config{ExecRoot: execRoot})
+	pool, poolErr := jsbridge.NewPool(jsbridge.Config{
+		ExecRoot:    execRoot,
+		RequireRoot: filepath.Join(home, "plugins"),
+	})
 	if poolErr != nil {
 		fmt.Fprintf(os.Stderr, "qrpdsh: no JavaScript evaluator (%v); !!js expressions will be refused\n", poolErr)
 	} else {

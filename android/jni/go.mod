@@ -10,3 +10,5 @@ require (
 require gopkg.in/yaml.v3 v3.0.1 // indirect
 
 replace github.com/qiyuan2403/Q_RP_dsh => ../..
+
+replace github.com/qiyuan2403/Y_Cordis => /root/repos/Y_Cordis

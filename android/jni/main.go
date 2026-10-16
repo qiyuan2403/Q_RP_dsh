@@ -105,8 +105,9 @@ func runTurnJSON(req runRequest) string {
 		libDir := filepath.Join(binDir, "..", "lib")
 		conf := filepath.Join(binDir, "..", "etc", "tls", "openssl.cnf")
 		pool, poolErr := jsbridge.NewPool(jsbridge.Config{
-			Node:     req.NodePath,
-			ExecRoot: home,
+			Node:        req.NodePath,
+			ExecRoot:    home,
+			RequireRoot: filepath.Join(home, "plugins"),
 			Env: map[string]string{
 				"LD_LIBRARY_PATH": libDir,
 				// Termux's node build reads an OpenSSL config at startup;
@@ -135,7 +136,13 @@ func runTurnJSON(req runRequest) string {
 		}
 	}
 	registry := tools.NewRegistry()
-	if err := builtintools.Register(registry, builtintools.Options{Root: workDir, AllowShell: true}); err != nil {
+	profileDir := filepath.Join(home, "plugins")
+	if err := builtintools.Register(registry, builtintools.Options{
+		Root:        workDir,
+		AllowShell:  true,
+		ProfileDir:  profileDir,
+		HostVersion: Version,
+	}); err != nil {
 		return encode(runResponse{Error: err.Error()})
 	}
 
