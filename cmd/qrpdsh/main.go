@@ -21,9 +21,12 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/boot"
 	"github.com/qiyuan2403/Q_RP_dsh/llm"
 	"github.com/qiyuan2403/Q_RP_dsh/llm/openaichat"
+	"github.com/qiyuan2403/Q_RP_dsh/runtime"
 	"github.com/qiyuan2403/Q_RP_dsh/session"
 	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
+	"github.com/qiyuan2403/Y_Cordis/jsbridge"
+	"github.com/qiyuan2403/Y_Cordis/workspace"
 )
 
 func main() {
@@ -44,6 +47,7 @@ func run() int {
 		timeout     = fs.Duration("timeout", 10*time.Minute, "overall turn timeout")
 		showPrompt  = fs.Bool("print-prompt", false, "print the assembled system prompt and exit")
 		listProfile = fs.Bool("list-profile", false, "compose the profile, print its rows, and exit")
+		mountOnly   = fs.Bool("mount", false, "compose and mount the profile onto the kernel, then exit")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `usage: qrpdsh [flags] "task"
@@ -55,6 +59,7 @@ flags:
 examples:
   qrpdsh -print-prompt
   qrpdsh -list-profile -profile ./profiles/headless
+  qrpdsh -mount -profile ./profiles/headless -anchor ./package.json
   qrpdsh -model deepseek-chat -base-url https://api.deepseek.com/v1 -api-key $KEY "say hello"
 `)
 	}
@@ -68,6 +73,10 @@ examples:
 
 	if *listProfile {
 		return listProfileRows(*profilePath, *anchor)
+	}
+
+	if *mountOnly {
+		return mountProfile(*profilePath, *anchor, *home)
 	}
 
 	task := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -277,3 +286,88 @@ var _ llm.Provider = (*openaichat.Client)(nil)
 
 // unused guards against a build where every flag path is trimmed.
 var _ = errors.New
+
+// mountProfile composes a profile and mounts it onto the kernel.
+//
+// This is the end-to-end proof that the two halves connect: the loader's
+// two-phase `!!js` evaluation runs against real scopes, so a row gated on
+// `!ctx.get('profileContext')` is decided by the actual service registry rather
+// than by a test fixture.
+func mountProfile(profilePath, anchor, homeOverride string) int {
+	if profilePath == "" {
+		fmt.Fprintln(os.Stderr, "qrpdsh: -mount requires -profile")
+		return 2
+	}
+	home, err := resolveHome(homeOverride)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
+		return 1
+	}
+
+	// The `!!js` evaluator runs in a Node sidecar. It is optional: without it,
+	// any expression fails loudly rather than being treated as a literal.
+	var evaluator runtime.Evaluator
+	execRoot := ""
+	if caps := workspace.Probe(home); caps.Usable() && caps.Executable {
+		execRoot = home
+	}
+	pool, poolErr := jsbridge.NewPool(jsbridge.Config{ExecRoot: execRoot})
+	if poolErr != nil {
+		fmt.Fprintf(os.Stderr, "qrpdsh: no JavaScript evaluator (%v); !!js expressions will be refused\n", poolErr)
+	} else {
+		defer pool.Close()
+		evaluator = &jsbridge.Evaluator{Pool: pool, Base: jsbridge.Scope{
+			Home:    home,
+			Helpers: []string{"dshHomePath"},
+		}}
+	}
+
+	cwd, _ := os.Getwd()
+	rt, err := runtime.Mount(context.Background(), profilePath, anchor, runtime.Options{
+		Evaluator: evaluator,
+		Home:      home,
+		Cwd:       cwd,
+		Env:       envMap(),
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
+		return 1
+	}
+	defer rt.Dispose()
+
+	fmt.Println(rt.Describe())
+	for _, w := range rt.Warnings {
+		fmt.Printf("  warning: %s\n", w)
+	}
+	// Print the rows that did NOT mount, since those are what an operator needs
+	// to explain a missing capability.
+	for _, row := range rt.Rows {
+		if row.Skipped {
+			fmt.Printf("  skipped %-44s %s\n", row.Entry.ID, row.Reason)
+		}
+	}
+	return 0
+}
+
+// envMap snapshots the environment for `process.env` in expressions.
+//
+// Only the variables a config expression is expected to read are passed: the
+// full environment would carry credentials into a JavaScript engine.
+func envMap() map[string]string {
+	out := map[string]string{}
+	for _, key := range []string{
+		"DSH_PERMISSION_MODE",
+		"DSH_TELEMETRY_MODE",
+		"DSH_TELEMETRY_OTLP_URL",
+		"DSH_TOOLS_MODE",
+		"DSH_SYSTEM_PROMPT",
+		"DSH_CONTEXT_WINDOW",
+		"DSH_MAX_TOKENS_AS_SUCCESS",
+		"DSH_CLIENT_VERSION",
+	} {
+		if v, ok := os.LookupEnv(key); ok {
+			out[key] = v
+		}
+	}
+	return out
+}
