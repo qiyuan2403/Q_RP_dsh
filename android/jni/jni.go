@@ -51,16 +51,29 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/session"
 )
 
+// jniString converts a Go string to a JVM string and releases the C copy.
+//
+// C.CString allocates memory outside the Go heap, and NewStringUTF copies the
+// bytes into the JVM, so the C copy is dead the moment the call returns.
+// Without the free every JNI call that returns a string leaks; pollEvent runs
+// every 100ms while a turn streams, so even its empty-string answer would leak
+// continuously.
+func jniString(env *C.JNIEnv, s string) C.jstring {
+	c := C.CString(s)
+	defer C.free(unsafe.Pointer(c))
+	return C.jni_string(env, c)
+}
+
 //export Java_com_sta1n_qrpdsh_Native_version
 func Java_com_sta1n_qrpdsh_Native_version(env *C.JNIEnv, clazz C.jclass) C.jstring {
-	return C.jni_string(env, C.CString(Version))
+	return jniString(env, Version)
 }
 
 //export Java_com_sta1n_qrpdsh_Native_runTurn
-func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, home, workDir, baseURL, apiKey, model, nodePath, sessionID C.jstring) C.jstring {
+func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, home, workDir, baseURL, apiKey, model, nodePath, sessionID, searchAPIKey C.jstring) C.jstring {
 	// Each Java String is copied out before use: the JNI reference is only
 	// valid while the JVM keeps it alive, so the Go side must not retain it.
-	args := []C.jstring{task, home, workDir, baseURL, apiKey, model, nodePath, sessionID}
+	args := []C.jstring{task, home, workDir, baseURL, apiKey, model, nodePath, sessionID, searchAPIKey}
 	cp := make([]*C.char, len(args))
 	for i, a := range args {
 		cp[i] = C.jni_cstr(env, a)
@@ -72,17 +85,33 @@ func Java_com_sta1n_qrpdsh_Native_runTurn(env *C.JNIEnv, clazz C.jclass, task, h
 	}()
 
 	req := runRequest{
-		Task:      C.GoString(cp[0]),
-		Home:      C.GoString(cp[1]),
-		WorkDir:   C.GoString(cp[2]),
-		BaseURL:   C.GoString(cp[3]),
-		APIKey:    C.GoString(cp[4]),
-		Model:     C.GoString(cp[5]),
-		NodePath:  C.GoString(cp[6]),
-		SessionID: C.GoString(cp[7]),
+		Task:         C.GoString(cp[0]),
+		Home:         C.GoString(cp[1]),
+		WorkDir:      C.GoString(cp[2]),
+		BaseURL:      C.GoString(cp[3]),
+		APIKey:       C.GoString(cp[4]),
+		Model:        C.GoString(cp[5]),
+		NodePath:     C.GoString(cp[6]),
+		SessionID:    C.GoString(cp[7]),
+		SearchAPIKey: C.GoString(cp[8]),
 	}
 	out := runTurnJSON(req)
-	return C.jni_string(env, C.CString(out))
+	return jniString(env, out)
+}
+
+// Java_com_sta1n_qrpdsh_Native_cancelTurn requests cancellation of the running
+// turn for one session.
+//
+// The call is deliberately fire-and-forget: the Java side cancels from a UI
+// thread while the turn runs on its own worker, so there is nothing to wait
+// for. An unknown session is a no-op — the turn may already have finished.
+//
+//export Java_com_sta1n_qrpdsh_Native_cancelTurn
+func Java_com_sta1n_qrpdsh_Native_cancelTurn(env *C.JNIEnv, clazz C.jclass, sessionID C.jstring) {
+	cID := C.jni_cstr(env, sessionID)
+	goID := C.GoString(cID)
+	C.free(unsafe.Pointer(cID))
+	cancelTurnForSession(goID)
 }
 
 // openSessionNativeJSON opens (creating if needed) a session under home and
@@ -107,7 +136,7 @@ func Java_com_sta1n_qrpdsh_Native_openSession(env *C.JNIEnv, clazz C.jclass, hom
 			name := entries[i].Name()
 			if log, err := session.Open(filepath.Join(goHome, "sessions", name)); err == nil {
 				sessions[name] = log
-				return C.jni_string(env, C.CString(sessionJSON(log, name)))
+				return jniString(env, sessionJSON(log, name))
 			}
 		}
 	}
@@ -119,10 +148,10 @@ func Java_com_sta1n_qrpdsh_Native_openSession(env *C.JNIEnv, clazz C.jclass, hom
 		CWD:       goHome,
 	})
 	if err != nil {
-		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+		return jniString(env, `{"error":"`+err.Error()+`"}`)
 	}
 	sessions[id] = log
-	return C.jni_string(env, C.CString(sessionJSON(log, id)))
+	return jniString(env, sessionJSON(log, id))
 }
 
 // sessionJSON renders the id plus every recorded event for the UI replay.
@@ -158,10 +187,12 @@ func Java_com_sta1n_qrpdsh_Native_closeSession(env *C.JNIEnv, clazz C.jclass, id
 }
 
 // pollEventNative blocks until one live event for the session arrives, then
-// returns it as JSON. Returns an empty string when the stream is over — the
-// turn finished or the session is unknown. The caller polls on a dedicated
-// Java worker thread, so every JNIEnv use here belongs to the JVM: no Go
-// thread ever calls back into it.
+// returns it as JSON. The channel is the session's merged stream: durable log
+// events and the temporary agent/assistant-stream frames of the running turn
+// arrive through this one call. Returns an empty string when the stream is over
+// — the turn finished or the session is unknown. The caller polls on a
+// dedicated Java worker thread, so every JNIEnv use here belongs to the JVM: no
+// Go thread ever calls back into it.
 //
 //export Java_com_sta1n_qrpdsh_Native_pollEvent
 func Java_com_sta1n_qrpdsh_Native_pollEvent(env *C.JNIEnv, clazz C.jclass, sessionID C.jstring, timeoutMs C.jint) C.jstring {
@@ -170,26 +201,27 @@ func Java_com_sta1n_qrpdsh_Native_pollEvent(env *C.JNIEnv, clazz C.jclass, sessi
 	goID := C.GoString(cID)
 
 	streamsMu.Lock()
-	ch, ok := eventStreams[goID]
+	stream, ok := eventStreams[goID]
 	streamsMu.Unlock()
 	if !ok {
-		return C.jni_string(env, C.CString(""))
+		return jniString(env, "")
 	}
+	ch := stream.ch
 
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	select {
 	case e, open := <-ch:
 		if !open {
-			return C.jni_string(env, C.CString(""))
+			return jniString(env, "")
 		}
 		raw, err := json.Marshal(e)
 		if err != nil {
-			return C.jni_string(env, C.CString(""))
+			return jniString(env, "")
 		}
-		return C.jni_string(env, C.CString(string(raw)))
+		return jniString(env, string(raw))
 	case <-time.After(timeout):
 		// No event within the window: an empty string means "poll again".
-		return C.jni_string(env, C.CString(""))
+		return jniString(env, "")
 	}
 }
 
@@ -221,7 +253,7 @@ func Java_com_sta1n_qrpdsh_Native_listSessions(env *C.JNIEnv, clazz C.jclass, ho
 
 	entries, err := os.ReadDir(filepath.Join(goHome, "sessions"))
 	if err != nil {
-		return C.jni_string(env, C.CString(`[]`))
+		return jniString(env, `[]`)
 	}
 
 	type row struct {
@@ -282,7 +314,7 @@ func Java_com_sta1n_qrpdsh_Native_listSessions(env *C.JNIEnv, clazz C.jclass, ho
 	for i, r := range rows {
 		parts[i] = r.json
 	}
-	return C.jni_string(env, C.CString("["+strings.Join(parts, ",")+"]"))
+	return jniString(env, "["+strings.Join(parts, ",")+"]")
 }
 
 // openSessionIdNativeJSON opens one session by directory name and returns
@@ -300,7 +332,7 @@ func Java_com_sta1n_qrpdsh_Native_openSessionId(env *C.JNIEnv, clazz C.jclass, h
 
 	// The id is a directory name; refuse traversal outright.
 	if goID == "" || strings.Contains(goID, "/") || strings.Contains(goID, "..") {
-		return C.jni_string(env, C.CString(`{"error":"invalid session id"}`))
+		return jniString(env, `{"error":"invalid session id"}`)
 	}
 
 	sessionsMu.Lock()
@@ -309,14 +341,14 @@ func Java_com_sta1n_qrpdsh_Native_openSessionId(env *C.JNIEnv, clazz C.jclass, h
 	// A session already open in this process keeps its live log — its
 	// subscribers survive; reopening would orphan them.
 	if log, ok := sessions[goID]; ok {
-		return C.jni_string(env, C.CString(sessionJSON(log, goID)))
+		return jniString(env, sessionJSON(log, goID))
 	}
 	log, err := session.Open(filepath.Join(goHome, "sessions", goID))
 	if err != nil {
-		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+		return jniString(env, `{"error":"`+err.Error()+`"}`)
 	}
 	sessions[goID] = log
-	return C.jni_string(env, C.CString(sessionJSON(log, goID)))
+	return jniString(env, sessionJSON(log, goID))
 }
 
 // createSessionNativeJSON starts a new blank session (the official
@@ -338,8 +370,8 @@ func Java_com_sta1n_qrpdsh_Native_createSession(env *C.JNIEnv, clazz C.jclass, h
 		CWD:       goHome,
 	})
 	if err != nil {
-		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+		return jniString(env, `{"error":"`+err.Error()+`"}`)
 	}
 	sessions[id] = log
-	return C.jni_string(env, C.CString(sessionJSON(log, id)))
+	return jniString(env, sessionJSON(log, id))
 }

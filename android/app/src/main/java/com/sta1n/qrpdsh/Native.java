@@ -45,11 +45,19 @@ public final class Native {
      * A null path disables the JS layer for the turn: config expressions are
      * refused and npm plugins stay dormant. The harness runs without it.
      *
+     * <p>{@code searchApiKey} is the DeepSeek key for the web search provider,
+     * or {@code null} or empty when none is configured. It is passed per request
+     * because an Android app process inherits no shell environment: the
+     * provider cannot fall back to {@code DEEPSEEK_API_KEY}.
+     *
      * <p>Blocking. Call from a worker thread.
      */
     public static native String runTurn(String task, String home, String workDir,
                                         String baseUrl, String apiKey, String model,
-                                        String nodePath, String sessionId);
+                                        String nodePath, String sessionId, String searchApiKey);
+
+    /** Requests cancellation of the running turn for this session. Safe to call from any thread; no-op when nothing is running. */
+    public static native void cancelTurn(String sessionId);
 
     /**
      * Opens (or resumes) the newest session under {@code home} and returns a

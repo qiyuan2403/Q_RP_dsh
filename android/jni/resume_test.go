@@ -251,7 +251,7 @@ func TestSessionHistoryFailsLoudly(t *testing.T) {
 // tools are present, and the built-ins are still registered only once — a
 // duplicate registration fails buildToolset, so success here proves it.
 func TestBuildToolsetRegistersWebTools(t *testing.T) {
-	registry, err := buildToolset(t.TempDir(), t.TempDir())
+	registry, err := buildToolset(t.TempDir(), t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("buildToolset: %v", err)
 	}
