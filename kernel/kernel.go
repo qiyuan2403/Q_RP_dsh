@@ -27,6 +27,10 @@ const (
 	ServiceProvider = "llm"
 	// ServiceAgent exposes the agent factory.
 	ServiceAgent = "agent"
+	// ServiceWeb exposes the web capability seam the web tools consume. Web
+	// provider and tool plugins declare it in `inject`, so the name is part of
+	// the plugin ABI rather than a deployment-local detail.
+	ServiceWeb = "web"
 )
 
 // Harness is a composed kernel context with the DSH services registered.
@@ -53,7 +57,7 @@ func New() *Harness {
 // plugin that never activates.
 func (h *Harness) Provide(name string, value any, check func() bool) error {
 	switch name {
-	case ServiceSession, ServiceTools, ServiceProvider, ServiceAgent:
+	case ServiceSession, ServiceTools, ServiceProvider, ServiceAgent, ServiceWeb:
 	default:
 		return fmt.Errorf("kernel: unknown harness service %q", name)
 	}

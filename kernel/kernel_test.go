@@ -34,6 +34,23 @@ func TestProvidedListsWhatWasRegistered(t *testing.T) {
 	}
 }
 
+// TestWebServiceNameIsAccepted pins that the web seam is part of the service
+// ABI. A web tool plugin injects "web"; if the name were rejected here the
+// plugin could never leave PENDING and the failure would look like a loader
+// bug rather than a missing service registration.
+func TestWebServiceNameIsAccepted(t *testing.T) {
+	h := New()
+	if err := h.Provide(ServiceWeb, "web-runtime", nil); err != nil {
+		t.Fatalf("Provide(%s): %v", ServiceWeb, err)
+	}
+	if ServiceWeb != "web" {
+		t.Fatalf("ServiceWeb = %q, want the official name", ServiceWeb)
+	}
+	if got := h.Provided(); len(got) != 1 || got[0] != ServiceWeb {
+		t.Fatalf("Provided = %v", got)
+	}
+}
+
 // TestPluginStaysPendingUntilItsInjectionArrives pins that the harness composes
 // with the kernel's reactivity rather than working around it: a plugin that
 // injects a service waits for it.

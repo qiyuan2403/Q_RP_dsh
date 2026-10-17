@@ -22,6 +22,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -37,6 +38,19 @@ import (
 // evaluator is allowed, and any expression then fails loudly rather than being
 // silently treated as a literal.
 type Evaluator = loader.Evaluator
+
+// PluginFactory builds the Go implementation of one composition row.
+//
+// It returns a fresh plugin per mount instead of a shared instance so each
+// mount gets its own closures: a body that captures a service, a counter, or a
+// config value must not carry that state into another mount. The kernel already
+// keeps inject sets and resolved config per fiber, so those are not the reason.
+//
+// A body's ResolveConfig hook must NOT mutate the config it receives: the raw
+// value can be the composition's own object, and upstream interpolation yields a
+// copy before the plugin sees it. A hook that wants to normalize should return a
+// new value.
+type PluginFactory func() *cordis.Plugin
 
 // Options configures a mount.
 type Options struct {
@@ -59,6 +73,20 @@ type Options struct {
 	// hook exists so a composition can supply them without a plugin body, which
 	// is what makes a row's `config` expression able to read `ctx.<service>`.
 	SeedRow func(e *loader.Entry, row *cordis.Context) error
+	// Registry maps a loader row name to its Go plugin body. A row with no entry
+	// keeps the current placeholder body: it activates but does nothing.
+	//
+	// The loader composes plugins this host does not resolve yet, so a profile's
+	// name is the only handle it has on a Go implementation. Keying by row Name
+	// rather than ID is what lets one implementation serve every row that names
+	// it; nil means "no implementations registered" and leaves the placeholder
+	// path untouched.
+	//
+	// Inject precedence: the plugin's own list comes first, then the row's names
+	// are appended (first occurrence wins). The kernel's Plugin.Inject is a
+	// []string without values, so a row cannot override an intercept config yet;
+	// when it can, this merge must let the row's value win, as upstream does.
+	Registry map[string]PluginFactory
 }
 
 // Runtime is a mounted harness.
@@ -75,6 +103,11 @@ type Runtime struct {
 	Evaluator Evaluator
 	// opts is retained so the row loader can consult the seeding hook.
 	opts Options
+	// rowContexts are the per-row scopes created during the mount, in
+	// composition order. Their fibers own the services SeedRow provided, and the
+	// kernel does not cascade a dispose into child fibers, so Dispose must
+	// withdraw them itself or a reuse of Options.Root would see stale services.
+	rowContexts []*cordis.Context
 }
 
 // Mount composes a profile and mounts it.
@@ -160,6 +193,7 @@ func (rt *Runtime) loadRow(e *loader.Entry, rowContexts map[*loader.Entry]*cordi
 	child := rt.Root.Child()
 	child.Fiber().SetStateForTest(cordis.Active)
 	rowContexts[e] = child
+	rt.rowContexts = append(rt.rowContexts, child)
 	if rt.opts.SeedRow != nil {
 		if err := rt.opts.SeedRow(e, child); err != nil {
 			return nil, fmt.Errorf("runtime: seeding row %q: %w", e.ID, err)
@@ -171,19 +205,91 @@ func (rt *Runtime) loadRow(e *loader.Entry, rowContexts map[*loader.Entry]*cordi
 		return nil, nil
 	}
 
+	// Resolving the row config is shared by both bodies: the placeholder still
+	// evaluates `!!js`, and a registered plugin needs the evaluated result
+	// before its own normalization runs.
+	resolveRowConfig := func(*cordis.Context, any) (any, error) {
+		return e.ResolveConfig(rt.ctxOrBackground(), rt.Evaluator, rt.Mounter.Scopes)
+	}
+
+	factory, registered := rt.opts.Registry[e.Name]
+	// A present key with a nil value is a wiring bug, not "no implementation":
+	// treating it as unregistered would activate the row with the placeholder
+	// body and hide the mistake until someone wonders why the plugin does
+	// nothing. Refuse it here, where the row that names it is known.
+	if registered && factory == nil {
+		return nil, fmt.Errorf("runtime: plugin %q for row %q: registry entry is nil", e.Name, e.ID)
+	}
+	if !registered {
+		plugin := &cordis.Plugin{
+			Name:   e.Name,
+			Inject: e.InjectNames(),
+			// Apply is intentionally empty: without a Registry entry the row
+			// still activates and its config still resolves, which keeps the
+			// composition observable while no Go body exists for the plugin.
+			Apply:         func(*cordis.Context, any) error { return nil },
+			ResolveConfig: resolveRowConfig,
+		}
+		return child.Plugin(plugin, e.Config)
+	}
+
+	impl := factory()
+	if impl == nil {
+		return nil, fmt.Errorf("runtime: plugin %q for row %q: registry factory returned nil", e.Name, e.ID)
+	}
+
+	name := e.Name
+	if name == "" {
+		name = impl.Name
+	}
 	plugin := &cordis.Plugin{
-		Name:   e.Name,
-		Inject: e.InjectNames(),
-		// Apply is intentionally empty until a plugin body exists for the row.
-		// The row still activates and its config still resolves, which is what
-		// makes the composition observable; a plugin registry that maps a row
-		// name to a Go implementation replaces this.
-		Apply: func(*cordis.Context, any) error { return nil },
-		ResolveConfig: func(*cordis.Context, any) (any, error) {
-			return e.ResolveConfig(rt.ctxOrBackground(), rt.Evaluator, rt.Mounter.Scopes)
+		// The row name wins: it is what the composition and its diagnostics
+		// name, and what identifies the row to the operator. A row without a
+		// name can still carry the implementation's own.
+		Name:    name,
+		Inject:  mergeInject(impl.Inject, e.InjectNames()),
+		Provide: impl.Provide,
+		Apply:   impl.Apply,
+		ResolveConfig: func(ctx *cordis.Context, raw any) (any, error) {
+			// Row interpolation first, plugin normalization second: the official
+			// loader interpolates in the `internal/config` waterfall and the
+			// plugin's Config schema sees the evaluated object (index.ts:112).
+			resolved, err := resolveRowConfig(ctx, raw)
+			if err != nil {
+				return nil, err
+			}
+			if impl.ResolveConfig == nil {
+				return resolved, nil
+			}
+			return impl.ResolveConfig(ctx, resolved)
 		},
 	}
 	return child.Plugin(plugin, e.Config)
+}
+
+// mergeInject appends the row's declared injections to the plugin's own.
+//
+// The official loader resolves an entry's inject INTO the fiber's inject map
+// after the plugin's own has been seeded (vendor/loader/src/index.ts:134), so a
+// row can add requirements but never drop or reorder the plugin's. First
+// occurrence wins, which keeps the merged order stable for diagnostics and makes
+// duplicate declarations harmless.
+func mergeInject(own, row []string) []string {
+	if len(own) == 0 && len(row) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(own)+len(row))
+	seen := make(map[string]struct{}, len(own)+len(row))
+	for _, list := range [][]string{own, row} {
+		for _, name := range list {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func (rt *Runtime) ctxOrBackground() context.Context {
@@ -231,8 +337,46 @@ func (rt *Runtime) Describe() string {
 }
 
 // Dispose tears the mounted harness down.
+//
+// Rows are disposed in reverse composition order, then the root: a row's effects
+// were registered while mounting, so LIFO is the order that withdraws dependents
+// before their dependencies. The kernel does not propagate a parent's dispose
+// into child fibers (the upstream model does, by having ctx.plugin register the
+// child's disposer as an effect of the parent), so the runtime has to walk its
+// own rows. Without that walk every row's registered tools, providers, and
+// servers would outlive the mount.
+//
+// A fiber mounted BY a plugin body (ctx.plugin inside Apply) is still not
+// reachable from here; this walks one level, which is what the loader creates.
 func (rt *Runtime) Dispose() error {
-	return rt.Root.Fiber().Dispose()
+	var errs []error
+	for i := len(rt.Rows) - 1; i >= 0; i-- {
+		fiber := rt.Rows[i].Fiber
+		if fiber == nil {
+			continue
+		}
+		if err := fiber.Dispose(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: disposing row %q: %w", rt.Rows[i].Entry.ID, err))
+		}
+	}
+	// The row scopes are disposed after their plugin fibers, deepest effect
+	// first: a scope's fiber owns the services SeedRow provided, and leaving it
+	// active would keep them visible to a later mount on the same root.
+	for i := len(rt.rowContexts) - 1; i >= 0; i-- {
+		ctx := rt.rowContexts[i]
+		if ctx == nil || ctx.Fiber() == nil {
+			continue
+		}
+		if err := ctx.Fiber().Dispose(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: disposing row scope %d: %w", i, err))
+		}
+	}
+	if rt.Root != nil {
+		if err := rt.Root.Fiber().Dispose(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: disposing root: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // hostPlatform maps the Go OS name to the Node-style platform name expressions
