@@ -26,6 +26,10 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
 	builtintools "github.com/qiyuan2403/Q_RP_dsh/tools/builtin"
+	toolweb "github.com/qiyuan2403/Q_RP_dsh/tools/web"
+	"github.com/qiyuan2403/Q_RP_dsh/web"
+	"github.com/qiyuan2403/Q_RP_dsh/web/deepseeksearch"
+	"github.com/qiyuan2403/Q_RP_dsh/web/httpfetch"
 	"github.com/qiyuan2403/Y_Cordis/jsbridge"
 	"github.com/qiyuan2403/Y_Cordis/workspace"
 )
@@ -71,7 +75,12 @@ examples:
 	}
 
 	if *showPrompt {
-		return printPrompt(*persona)
+		return printPrompt(runConfig{
+			home:       *home,
+			persona:    *persona,
+			workDir:    *workDir,
+			allowShell: *allowShell,
+		})
 	}
 
 	if *listProfile {
@@ -133,20 +142,72 @@ func resolveHome(override string) (string, error) {
 	return filepath.Join(base, ".qrpdsh"), nil
 }
 
-// buildRegistry returns the tools available to a turn.
+// buildToolset returns the tools available to a turn and the web service the
+// web tools call.
+//
+// The web service is returned rather than kept private because registering its
+// providers is the deployment's decision: providers need credentials and
+// endpoints the registry does not own, and a missing provider must surface as a
+// structured tool error rather than a missing tool.
 //
 // Every tool is bounded by `root`, so a model mistake cannot reach outside the
-// directory the harness was pointed at.
-func buildRegistry(root string, allowShell bool) (*tools.Registry, error) {
+// directory the harness was pointed at. The plugin profile is the only other
+// directory the built-in tools are allowed to manage.
+func buildToolset(root, profileDir string, allowShell bool) (*tools.Registry, *web.Web, error) {
 	r := tools.NewRegistry()
-	if err := builtintools.Register(r, builtintools.Options{Root: root, AllowShell: allowShell}); err != nil {
-		return nil, err
+	if err := builtintools.Register(r, builtintools.Options{
+		Root:       root,
+		AllowShell: allowShell,
+		ProfileDir: profileDir,
+	}); err != nil {
+		return nil, nil, err
 	}
-	return r, nil
+	w := web.New(web.Config{})
+	if err := registerWebProviders(w); err != nil {
+		return nil, nil, err
+	}
+	if err := toolweb.Register(r, w, toolweb.Options{}); err != nil {
+		return nil, nil, err
+	}
+	return r, w, nil
+}
+
+// registerWebProviders mounts the web providers this deployment ships.
+//
+// Both are registered even when one is unusable: the DeepSeek search provider
+// reports unavailable until DEEPSEEK_API_KEY exists, and the seam turns that
+// into a structured selection error at call time rather than hiding the
+// capability. Provider selection itself stays on the web service, so a
+// deployment that wants a different provider only changes this function.
+func registerWebProviders(w *web.Web) error {
+	if w == nil {
+		return nil
+	}
+	fetch, err := httpfetch.New(httpfetch.Config{})
+	if err != nil {
+		return fmt.Errorf("qrpdsh: constructing the http fetch provider: %w", err)
+	}
+	if _, err := w.RegisterFetchProvider(fetch); err != nil {
+		return fmt.Errorf("qrpdsh: registering the http fetch provider: %w", err)
+	}
+	search, err := deepseeksearch.New(deepseeksearch.Config{})
+	if err != nil {
+		return fmt.Errorf("qrpdsh: constructing the deepseek search provider: %w", err)
+	}
+	if _, err := w.RegisterSearchProvider(search); err != nil {
+		return fmt.Errorf("qrpdsh: registering the deepseek search provider: %w", err)
+	}
+	return nil
 }
 
 // assemblePrompt builds the system prompt for one deployment.
-func assemblePrompt(persona string) (*systemprompt.Assembly, error) {
+//
+// Tool-owned guidance is contributed from the registered tools, not from a
+// central block: the text that describes a tool rides with the tool that
+// carries the behavior, which is how the official harness keeps the two from
+// drifting. A nil registry means "no tools to describe" and leaves the prompt
+// with only its identity and persona sections.
+func assemblePrompt(persona string, registry *tools.Registry) (*systemprompt.Assembly, error) {
 	r := systemprompt.New()
 	if err := r.Section(systemprompt.Section{
 		Name:  "harness-identity",
@@ -164,22 +225,56 @@ func assemblePrompt(persona string) (*systemprompt.Assembly, error) {
 			return nil, err
 		}
 	}
+	if registry != nil {
+		if err := builtintools.AttachPromptSections(r, registry); err != nil {
+			return nil, err
+		}
+		// Each web section is attached only when its tool is registered, so a
+		// composition that disables one does not describe a tool the model
+		// cannot call. The search text also branches on web_fetch visibility.
+		_, haveSearch := registry.Lookup(toolweb.SearchToolName)
+		_, haveFetch := registry.Lookup(toolweb.FetchToolName)
+		if err := toolweb.AttachPromptSectionsFor(r, haveSearch, haveFetch); err != nil {
+			return nil, err
+		}
+	}
 	return r.Assemble(systemprompt.AssembleContext{})
 }
 
-func printPrompt(persona string) int {
-	assembly, err := assemblePrompt(persona)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
-		return 1
-	}
-	text, err := systemprompt.Render(assembly)
+func printPrompt(cfg runConfig) int {
+	text, err := previewPrompt(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
 		return 1
 	}
 	fmt.Println(text)
 	return 0
+}
+
+// previewPrompt renders the system prompt a turn WOULD send for cfg.
+//
+// It resolves the same home, working directory, plugin profile, and toolset a
+// turn does: a preview that is assembled from different inputs than the real
+// turn is worse than no preview, because it looks authoritative while
+// describing a prompt the model will never see.
+func previewPrompt(cfg runConfig) (string, error) {
+	home, err := resolveHome(cfg.home)
+	if err != nil {
+		return "", err
+	}
+	workRoot := cfg.workDir
+	if workRoot == "" {
+		workRoot, _ = os.Getwd()
+	}
+	registry, _, err := buildToolset(workRoot, filepath.Join(home, "plugins"), cfg.allowShell)
+	if err != nil {
+		return "", err
+	}
+	assembly, err := assemblePrompt(cfg.persona, registry)
+	if err != nil {
+		return "", err
+	}
+	return systemprompt.Render(assembly)
 }
 
 // listProfileRows composes a profile and prints its rows, so a composition can
@@ -229,7 +324,18 @@ func runTurn(cfg runConfig) int {
 	ctx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
 
-	assembly, err := assemblePrompt(cfg.persona)
+	workRoot := cfg.workDir
+	if workRoot == "" {
+		workRoot, _ = os.Getwd()
+	}
+	profileDir := filepath.Join(home, "plugins")
+	registry, _, err := buildToolset(workRoot, profileDir, cfg.allowShell)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
+		return 1
+	}
+
+	assembly, err := assemblePrompt(cfg.persona, registry)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
 		return 1
@@ -254,23 +360,6 @@ func runTurn(cfg runConfig) int {
 	}
 	defer log.Close()
 
-	workRoot := cfg.workDir
-	if workRoot == "" {
-		workRoot, _ = os.Getwd()
-	}
-	registry, err := buildRegistry(workRoot, cfg.allowShell)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
-		return 1
-	}
-	profileDir := filepath.Join(home, "plugins")
-	if err := builtintools.Register(registry, builtintools.Options{
-		Root:       workRoot,
-		ProfileDir: profileDir,
-	}); err != nil {
-		fmt.Fprintln(os.Stderr, "qrpdsh:", err)
-		return 1
-	}
 	provider := openaichat.New(openaichat.Config{
 		BaseURL: cfg.baseURL,
 		APIKey:  cfg.apiKey,
