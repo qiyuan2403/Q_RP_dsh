@@ -45,6 +45,15 @@ type Config struct {
 	// A model that keeps requesting tools forever would otherwise burn tokens
 	// without bound; the cap turns that into a reported stop reason.
 	MaxSteps int
+	// OnAssistantStream receives process-local streaming frames for live
+	// observers.
+	//
+	// It runs synchronously on the turn's goroutine and must not block: a slow
+	// observer would stall the model call, because delivery happens between the
+	// provider's chunks. Only streamed model calls produce frames; a
+	// non-streaming provider produces none and observers fall back to the final
+	// message. Nil disables framing.
+	OnAssistantStream func(AssistantStreamFrame)
 }
 
 // Agent is one conversation.
@@ -56,6 +65,14 @@ type Agent struct {
 	running bool
 	// history is the model-visible message list, rebuilt from the log.
 	history []llm.Message
+
+	// turns, attempts, and revision number the live stream. turns advances at
+	// turn start under mu; attempts and revision advance only on the running
+	// turn's goroutine, which the single-flight guard makes the sole writer, so
+	// they need no lock of their own.
+	turns    int
+	attempts int
+	revision int
 }
 
 // New builds an agent over an open session log.
@@ -104,6 +121,8 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (TurnResult, error
 		return TurnResult{}, ErrBusy
 	}
 	a.running = true
+	a.turns++
+	turn := a.turns
 	a.mu.Unlock()
 	defer func() {
 		a.mu.Lock()
@@ -128,7 +147,7 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (TurnResult, error
 		return TurnResult{}, err
 	}
 
-	result := a.drive(ctx)
+	result := a.drive(ctx, turn)
 
 	endData := map[string]any{"reason": string(result.Reason), "steps": result.Steps}
 	if result.Err != nil {
@@ -149,11 +168,25 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (TurnResult, error
 	return result, nil
 }
 
+// isCancellation reports whether a dead context means the caller asked to stop.
+//
+// DeadlineExceeded deliberately does not qualify: nobody asked to stop, the
+// call failed to finish in time, and that failure is what the app must show.
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
 // drive runs the step loop.
-func (a *Agent) drive(ctx context.Context) TurnResult {
+func (a *Agent) drive(ctx context.Context, turn int) TurnResult {
 	for step := 0; step < a.cfg.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
-			return TurnResult{Reason: StopCancelled, Steps: step, Err: err}
+			// A deadline is not a cancellation: the caller did not ask to stop,
+			// the turn ran out of time, and the app must present that as an
+			// error rather than clearing the live reply as an interruption.
+			if isCancellation(err) {
+				return TurnResult{Reason: StopCancelled, Steps: step, Err: err}
+			}
+			return TurnResult{Reason: StopModelError, Steps: step, Err: err}
 		}
 		stepStart, err := a.log.Append(session.Event{
 			Type: "step/start",
@@ -164,22 +197,35 @@ func (a *Agent) drive(ctx context.Context) TurnResult {
 		}
 		_ = stepStart
 
-		resp, err := a.callModel(ctx)
+		resp, attempt, err := a.callModel(ctx, turn, step)
 		if err != nil {
+			// A cancelled context is reported as cancellation even when the
+			// provider surfaces it as its own error: the caller asked to stop,
+			// and that intent is the fact worth reporting. A deadline keeps the
+			// provider's error and stops as a model failure, so the app shows
+			// the timeout instead of treating it as a user interruption.
+			if ctxErr := ctx.Err(); isCancellation(ctxErr) {
+				return TurnResult{Reason: StopCancelled, Steps: step + 1, Err: ctxErr}
+			}
 			return TurnResult{Reason: StopModelError, Steps: step + 1, Err: err}
 		}
 
 		// Record the assistant turn before running its tools: the log must show
 		// what the model asked for even if a tool then fails.
-		if _, err := a.log.Append(session.Event{
+		messageEvent, err := a.log.Append(session.Event{
 			Type: "assistant/message",
 			Data: mustJSON(map[string]any{
 				"text":      resp.Text,
 				"toolCalls": toolCallsJSON(resp.ToolCalls),
 			}),
-		}); err != nil {
+		})
+		if err != nil {
+			// The live stream saw chunks this log now has no event for, so it
+			// is abandoned rather than reported as committed.
+			attempt.abandon()
 			return TurnResult{Reason: StopModelError, Steps: step + 1, Err: err}
 		}
+		attempt.commit(messageEvent.Seq)
 		a.history = append(a.history, llm.Message{
 			Role:      llm.RoleAssistant,
 			Text:      resp.Text,
@@ -247,7 +293,13 @@ func (a *Agent) drive(ctx context.Context) TurnResult {
 	return TurnResult{Reason: StopMaxSteps, Steps: a.cfg.MaxSteps}
 }
 
-func (a *Agent) callModel(ctx context.Context) (llm.Response, error) {
+// callModel makes one model request.
+//
+// The returned attempt is the live framing state the caller settles after the
+// assistant/message append. It is nil for a non-streaming provider, where the
+// call produced no frames, and on error, where this function has already
+// emitted the terminal frame.
+func (a *Agent) callModel(ctx context.Context, turn, step int) (llm.Response, *streamAttempt, error) {
 	req := llm.Request{
 		Model:    a.cfg.Model,
 		System:   a.cfg.SystemPrompt,
@@ -256,17 +308,38 @@ func (a *Agent) callModel(ctx context.Context) (llm.Response, error) {
 	if a.cfg.Registry != nil {
 		req.Tools = a.cfg.Registry.Specs()
 	}
-	if streamed, ok := a.cfg.Provider.(llm.StreamProvider); ok {
-		return streamResponse(ctx, streamed, req)
+	streamed, ok := a.cfg.Provider.(llm.StreamProvider)
+	if !ok {
+		resp, err := a.cfg.Provider.Complete(ctx, req)
+		return resp, nil, err
 	}
-	return a.cfg.Provider.Complete(ctx, req)
+	// The attempt opens before the provider is called so a call that dies
+	// before its first chunk still has a terminal frame to close it.
+	attempt := a.beginAttempt(turn, step)
+	resp, err := streamResponse(ctx, streamed, req, attempt)
+	if err != nil {
+		// Abandon before returning: whether the stream failed or the context
+		// was cancelled, no assistant/message will be written for it.
+		attempt.abandon()
+		return llm.Response{}, nil, err
+	}
+	return resp, attempt, nil
 }
 
-func streamResponse(ctx context.Context, provider llm.StreamProvider, req llm.Request) (llm.Response, error) {
+func streamResponse(ctx context.Context, provider llm.StreamProvider, req llm.Request, attempt *streamAttempt) (llm.Response, error) {
 	var text strings.Builder
 	toolCalls := make([]llm.ToolCall, 0)
 	var usage llm.Usage
 	err := provider.Stream(ctx, req, func(chunk llm.StreamChunk) error {
+		// A provider can produce another chunk after the caller cancelled. The
+		// frame must not go out: the observer already closed the attempt's live
+		// segment, and a late chunk would reopen it with content the turn is
+		// about to abandon. Returning the context error also tells a
+		// cooperative provider to end its send loop.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		attempt.push(chunk)
 		text.WriteString(chunk.TextDelta)
 		if chunk.Usage != nil {
 			usage = *chunk.Usage
