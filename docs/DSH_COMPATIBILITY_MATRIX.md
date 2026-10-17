@@ -25,7 +25,7 @@
 | Scope、Mount | `packages/core/scope/src/`、`vendor/loader/src/index.ts`、`packages/boot/app-boot/src/profile-context.ts` | `/root/repos/Y_Cordis/cordis/`、`mount/` | scope/mount 实现与测试存在 | [ ] 以官方组合测试确认生命周期、跨 scope 服务可见性及退出顺序 |
 | Agent API 与事件 | `packages/core/agent/src/` | `Q_RP_dsh/agent/`、`kernel/` | Agent turn/tool 基础实现和本地测试存在 | [ ] 对照完整 Agent 状态、取消、生命周期事件和插件拦截合同 |
 | Agent loop、工具回合 | `packages/core/agent-loop/src/agent.ts`、`tool-calls.ts` | `agent/agent.go` | OpenAI-compatible SSE 文本、tool-call delta 拼装和多步工具回合有测试 | [ ] 官方 loop 样本覆盖 turn/step 边界、错误/重试、取消和恢复 |
-| 临时 assistant-stream | `packages/core/agent-loop/src/assistant-stream.ts`；上游事件 `agent/assistant-stream` | `agent/agent.go` 当前先收集流，完成后提交 `assistant/message` | 计划明确记录无临时帧 | [ ] 实现 start/chunk/end 传输、终态与 durable event 对应及 UI 增量消费 |
+| 临时 assistant-stream | `packages/core/agent-loop/src/assistant-stream.ts`；上游事件 `agent/assistant-stream` | `agent/stream.go` 发布 start/chunk/end 临时帧，不写日志；`android/jni/stream.go` 合并进 pollEvent；UI 节流增量渲染 | Go 帧序列、seq、取消/失败结算有测试；UI 仅离线编译 | [ ] 真机验证流式观感与切会话边界；上游中断时落 `assistant/attempt` 半截内容，Go 只发 abandoned，差异待定 |
 | Session store、surface 与 request header | `packages/core/session/src/index.ts`、`surface.ts`、`request-header.ts` | `session/log.go`、`vocabulary.go`、`agent/replay.go` | JSONL envelope、v4、未知必需事件拒绝、surface 元数据有实现和测试 | [ ] 用官方 session v4 样本比较 header/event 写入读取、surface fold、header fold、投影和恢复 |
 | Session repair 与 tool-call recovery | `packages/core/session/src/repair.ts` | 当前 `session/` 尚无完整对应的官方恢复流程 | 上游有中断 turn closers、未完成 tool call 恢复；计划明确恢复对齐未完成 | [ ] 对照中断 turn、取消、崩溃尾部、未完成工具调用和重启续写 |
 | Tools registry/schema/execution | `packages/core/tools/src/` | `tools/registry.go`、`tools/builtin/`、`agent/agent.go` | 注册、参数校验、调用和结果事件有实现 | [ ] 对照 schema 语义、执行边界、错误分类、并发/取消及官方 PTC 行为 |
@@ -43,7 +43,7 @@
 | 格式版本和 envelope | `packages/core/session/src/types.ts` (`SESSION_FORMAT_VERSION`, `SessionEvent`) | v4；`type/seq/time/data/ignorable/surfaceOp/sourceEventSeqs` 字段有对应 | [ ] 用官方生成样本比较编码、缺省字段、字段拒绝与跨实现 round-trip |
 | 事件名称 | `packages/core/session/src/known-event-types.ts` | `session/vocabulary.go` 当前名称集相符 | [ ] 机械集合差异检查加入 CI，防上游变化漏同步 |
 | Agent durable 事件 | `packages/core/session/src/types.ts`、`packages/core/agent-loop/src/agent.ts` | Go 写入基础 user/turn/step/assistant/tool 事件；`tool/result` 在 `output` 之外保存模型可见 `text`，恢复优先使用它 | [ ] 逐事件 payload、序号、时间和失败/取消路径对照 |
-| 临时 stream 帧 | `packages/core/agent-loop/src/assistant-stream.ts` | Go 当前未发布等价帧 | [ ] 实现并覆盖 start/chunk/end 及 abandoned/committed 终态 |
+| 临时 stream 帧 | `packages/core/agent-loop/src/assistant-stream.ts` | `agent/stream.go` 发布 start/chunk/end，committed 带 durable seq，错误/取消/append 失败为 abandoned；JNI 单通道转发，UI 节流消费；不写日志 | [x] start/chunk/end 与 abandoned/committed 终态有测试；[ ] 真机观感；start 时机、中断不落半截消息、丢帧行为记在 ADR 0003 |
 | Session surface/projection | `packages/core/session/src/surface.ts`、`types.ts` | Go event envelope 可保存 surface 元数据；重放/UI投影覆盖面有限 | [ ] 对照 append/replace、source seq、image/offload 解释和恢复结果 |
 | 损坏/中断恢复 | `packages/core/session/src/repair.ts`、`preparation.ts` | Go 可拒绝格式不匹配、非单调序号；没有证据证明 repair 行为等价 | [ ] 官方故障样本驱动的兼容测试 |
 
