@@ -448,11 +448,14 @@ func Discard(r io.Reader) { _, _ = io.Copy(io.Discard, r) }
 func (l *Log) Events() ([]Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// l.path IS the event log file (see Open), so it is passed through as-is.
+	// Joining LogFilename onto it again reads "<dir>/events.jsonl/events.jsonl"
+	// and fails with ENOTDIR, which would break every live log reader.
 	if l.closed {
-		return readEvents(filepath.Join(l.path, LogFilename))
+		return readEvents(l.path)
 	}
 	if err := l.writer.Flush(); err != nil {
 		return nil, err
 	}
-	return readEvents(filepath.Join(l.path, LogFilename))
+	return readEvents(l.path)
 }

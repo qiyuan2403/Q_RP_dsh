@@ -318,3 +318,43 @@ func TestVocabularyIsPinned(t *testing.T) {
 		t.Fatalf("FormatVersion = %d, want 4", FormatVersion)
 	}
 }
+
+// TestEventsReadsTheLiveLog pins that a live log's reader returns the events it
+// appended, including the buffered tail. The regression this guards is a path
+// bug: l.path is already the events file, so joining LogFilename onto it again
+// asked for "<dir>/events.jsonl/events.jsonl" and failed with ENOTDIR. Every
+// live reader (the Android session list and replay) depended on this working.
+func TestEventsReadsTheLiveLog(t *testing.T) {
+	log, dir := newLog(t)
+	if _, err := log.Append(Event{Type: "user/message", Data: json.RawMessage(`{"text":"hi"}`)}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "user/message" {
+		t.Fatalf("Events = %+v, want one user/message", events)
+	}
+	// The directory reader and the live reader must agree: they are the same
+	// file, and a disagreement would mean one view is stale.
+	fromDisk, err := ReadLog(dir)
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if len(fromDisk) != len(events) || fromDisk[0].Seq != events[0].Seq {
+		t.Fatalf("disk %+v disagrees with live %+v", fromDisk, events)
+	}
+	// A closed log still answers from the file rather than reporting a
+	// closed-writer error: readers outlive the writer.
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	after, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events after close: %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("Events after close = %+v, want one event", after)
+	}
+}
