@@ -15,17 +15,23 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/qiyuan2403/Q_RP_dsh/agent"
+	"github.com/qiyuan2403/Q_RP_dsh/llm"
 	"github.com/qiyuan2403/Q_RP_dsh/llm/openaichat"
 	"github.com/qiyuan2403/Q_RP_dsh/session"
 	"github.com/qiyuan2403/Q_RP_dsh/systemprompt"
 	"github.com/qiyuan2403/Q_RP_dsh/tools"
 	builtintools "github.com/qiyuan2403/Q_RP_dsh/tools/builtin"
+	toolweb "github.com/qiyuan2403/Q_RP_dsh/tools/web"
+	"github.com/qiyuan2403/Q_RP_dsh/web"
+	"github.com/qiyuan2403/Q_RP_dsh/web/deepseeksearch"
+	"github.com/qiyuan2403/Q_RP_dsh/web/httpfetch"
 	"github.com/qiyuan2403/Y_Cordis/jsbridge"
 	"github.com/qiyuan2403/Y_Cordis/loader"
 )
@@ -135,14 +141,8 @@ func runTurnJSON(req runRequest) string {
 			}
 		}
 	}
-	registry := tools.NewRegistry()
-	profileDir := filepath.Join(home, "plugins")
-	if err := builtintools.Register(registry, builtintools.Options{
-		Root:        workDir,
-		AllowShell:  true,
-		ProfileDir:  profileDir,
-		HostVersion: Version,
-	}); err != nil {
+	registry, err := buildToolset(workDir, filepath.Join(home, "plugins"))
+	if err != nil {
 		return encode(runResponse{Error: err.Error()})
 	}
 
@@ -187,6 +187,19 @@ func runTurnJSON(req runRequest) string {
 		MaxSteps:     32,
 	}, log)
 
+	// A resumed session must start from the conversation its log records: the
+	// agent object is rebuilt on every turn, so its history lives only here and
+	// only now. Skipping this makes every turn after the first look like the
+	// start of a conversation to the model. A fresh session has no history to
+	// restore and stays unseeded.
+	if req.SessionID != "" {
+		history, historyErr := sessionHistory(log, registry)
+		if historyErr != nil {
+			return encode(runResponse{Error: historyErr.Error()})
+		}
+		a.Seed(history)
+	}
+
 	// Live events: subscribe before the turn, keep the channel keyed by
 	// session id for pollEvent to drain on Java threads. A sessionless turn
 	// (the test entry point) publishes nothing.
@@ -224,6 +237,86 @@ func runTurnJSON(req runRequest) string {
 	return encode(resp)
 }
 
+// buildToolset returns the tools one turn offers.
+//
+// Every tool is bounded by root, the working directory the app granted the
+// turn. The web tools are registered even when no provider exists: the web
+// service resolves its provider per call, so a build without one reports a
+// structured "no usable web provider" tool error instead of hiding the
+// capability from the model and the prompt.
+//
+// There is exactly one built-in registration here. A second one would re-add
+// names already in the registry, and the registry refuses a duplicate rather
+// than replacing it, so the whole turn would fail before the model runs.
+func buildToolset(root, profileDir string) (*tools.Registry, error) {
+	registry := tools.NewRegistry()
+	if err := builtintools.Register(registry, builtintools.Options{
+		Root:        root,
+		AllowShell:  true,
+		ProfileDir:  profileDir,
+		HostVersion: Version,
+	}); err != nil {
+		return nil, err
+	}
+	w := web.New(web.Config{})
+	// Providers are mounted here rather than by a profile row because the
+	// Android host composes no profile for a turn: it builds the harness
+	// directly. Both are registered even when unusable (no DEEPSEEK_API_KEY on
+	// a fresh install), because the seam's structured selection error is more
+	// useful to the model than a silently absent capability.
+	fetch, err := httpfetch.New(httpfetch.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("jni: constructing the http fetch provider: %w", err)
+	}
+	if _, err := w.RegisterFetchProvider(fetch); err != nil {
+		return nil, fmt.Errorf("jni: registering the http fetch provider: %w", err)
+	}
+	search, err := deepseeksearch.New(deepseeksearch.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("jni: constructing the deepseek search provider: %w", err)
+	}
+	if _, err := w.RegisterSearchProvider(search); err != nil {
+		return nil, fmt.Errorf("jni: registering the deepseek search provider: %w", err)
+	}
+	if err := toolweb.Register(registry, w, toolweb.Options{}); err != nil {
+		return nil, err
+	}
+	return registry, nil
+}
+
+// sessionHistory rebuilds the model-visible history of an open session.
+//
+// The log is the only place the earlier turns survive, because the agent is
+// constructed per turn. The rebuilt list must match what the live loop had in
+// memory, so it goes through RebuildHistory with the same tool Render hooks
+// the registry holds now: a session resumed under a different projection would
+// show the model a different conversation than the one recorded.
+func sessionHistory(log *session.Log, registry *tools.Registry) ([]llm.Message, error) {
+	// Flush first: an event still sitting in the log's write buffer IS recorded,
+	// and a resumed turn that missed it would replay a shorter conversation than
+	// the log says happened. ReadLog then reads the whole session directory;
+	// Path names the log file inside it.
+	if err := log.Flush(); err != nil {
+		return nil, fmt.Errorf("jni: flushing session events: %w", err)
+	}
+	events, err := session.ReadLog(filepath.Dir(log.Path()))
+	if err != nil {
+		return nil, fmt.Errorf("jni: reading session events: %w", err)
+	}
+	lookup := func(name string) func(any) string {
+		tool, ok := registry.Lookup(name)
+		if !ok || tool.Render == nil {
+			return nil
+		}
+		return tool.Render
+	}
+	history, err := agent.RebuildHistory(events, lookup)
+	if err != nil {
+		return nil, fmt.Errorf("jni: rebuilding the session history: %w", err)
+	}
+	return history, nil
+}
+
 // buildPrompt assembles the system prompt for the mobile deployment.
 func buildPrompt(registry *tools.Registry) (*systemprompt.Assembly, error) {
 	r := systemprompt.New()
@@ -239,6 +332,15 @@ func buildPrompt(registry *tools.Registry) (*systemprompt.Assembly, error) {
 	// guidance from the tool itself, so the guidance cannot drift from the
 	// tool that carries the behavior.
 	if err := builtintools.AttachPromptSections(r, registry); err != nil {
+		return nil, err
+	}
+	// Each web section is attached only when its tool is registered, and the
+	// search guidance drops the web_fetch recommendation when that tool is
+	// absent: telling the model about a tool it cannot call is worse than
+	// saying nothing.
+	_, haveSearch := registry.Lookup(toolweb.SearchToolName)
+	_, haveFetch := registry.Lookup(toolweb.FetchToolName)
+	if err := toolweb.AttachPromptSectionsFor(r, haveSearch, haveFetch); err != nil {
 		return nil, err
 	}
 	return r.Assemble(systemprompt.AssembleContext{})

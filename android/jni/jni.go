@@ -45,6 +45,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/qiyuan2403/Q_RP_dsh/session"
@@ -190,4 +191,155 @@ func Java_com_sta1n_qrpdsh_Native_pollEvent(env *C.JNIEnv, clazz C.jclass, sessi
 		// No event within the window: an empty string means "poll again".
 		return C.jni_string(env, C.CString(""))
 	}
+}
+
+// sessionRowJSON mirrors the official SessionNode fields the sidebar row
+// renders: id, title, blank, running, updatedAt.
+func sessionRowJSON(id, title string, blank, running bool, updatedAt int64) string {
+	raw, err := json.Marshal(map[string]any{
+		"id":        id,
+		"title":     title,
+		"blank":     blank,
+		"running":   running,
+		"updatedAt": updatedAt,
+	})
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// sessionsNativeJSON lists every session under home, newest first
+// (orderByRecency in ui-workspace tree.ts). The title is the first user
+// message, truncated; a session with none is blank.
+//
+//export Java_com_sta1n_qrpdsh_Native_listSessions
+func Java_com_sta1n_qrpdsh_Native_listSessions(env *C.JNIEnv, clazz C.jclass, home C.jstring) C.jstring {
+	cHome := C.jni_cstr(env, home)
+	defer C.free(unsafe.Pointer(cHome))
+	goHome := C.GoString(cHome)
+
+	entries, err := os.ReadDir(filepath.Join(goHome, "sessions"))
+	if err != nil {
+		return C.jni_string(env, C.CString(`[]`))
+	}
+
+	type row struct {
+		json      string
+		updatedAt int64
+	}
+	rows := make([]row, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		log, err := session.Open(filepath.Join(goHome, "sessions", id))
+		if err != nil {
+			continue
+		}
+		events, _ := log.Events()
+		updatedAt := int64(0)
+		title := ""
+		running := false
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].Time > updatedAt {
+				updatedAt = events[i].Time
+			}
+		}
+		for _, ev := range events {
+			if ev.Type == "user/message" && title == "" {
+				var data struct {
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(ev.Data, &data) == nil && data.Text != "" {
+					title = data.Text
+					if len(title) > 60 {
+						title = title[:60]
+					}
+				}
+			}
+		}
+		header := log.Header()
+		if header.CreatedAt > updatedAt {
+			updatedAt = header.CreatedAt
+		}
+		_ = log.Close()
+		rows = append(rows, row{
+			json:      sessionRowJSON(id, title, title == "", running, updatedAt),
+			updatedAt: updatedAt,
+		})
+	}
+	// orderByRecency: newest first.
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[j].updatedAt > rows[i].updatedAt {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = r.json
+	}
+	return C.jni_string(env, C.CString("["+strings.Join(parts, ",")+"]"))
+}
+
+// openSessionIdNativeJSON opens one session by directory name and returns
+// its replay document. A missing or unopenable session returns an error
+// field — the caller refreshes the list rather than guessing.
+//
+//export Java_com_sta1n_qrpdsh_Native_openSessionId
+func Java_com_sta1n_qrpdsh_Native_openSessionId(env *C.JNIEnv, clazz C.jclass, home, id C.jstring) C.jstring {
+	cHome := C.jni_cstr(env, home)
+	defer C.free(unsafe.Pointer(cHome))
+	cID := C.jni_cstr(env, id)
+	defer C.free(unsafe.Pointer(cID))
+	goHome := C.GoString(cHome)
+	goID := C.GoString(cID)
+
+	// The id is a directory name; refuse traversal outright.
+	if goID == "" || strings.Contains(goID, "/") || strings.Contains(goID, "..") {
+		return C.jni_string(env, C.CString(`{"error":"invalid session id"}`))
+	}
+
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	// A session already open in this process keeps its live log — its
+	// subscribers survive; reopening would orphan them.
+	if log, ok := sessions[goID]; ok {
+		return C.jni_string(env, C.CString(sessionJSON(log, goID)))
+	}
+	log, err := session.Open(filepath.Join(goHome, "sessions", goID))
+	if err != nil {
+		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+	}
+	sessions[goID] = log
+	return C.jni_string(env, C.CString(sessionJSON(log, goID)))
+}
+
+// createSessionNativeJSON starts a new blank session (the official
+// startSession): it does NOT reuse or resume anything.
+//
+//export Java_com_sta1n_qrpdsh_Native_createSession
+func Java_com_sta1n_qrpdsh_Native_createSession(env *C.JNIEnv, clazz C.jclass, home C.jstring) C.jstring {
+	cHome := C.jni_cstr(env, home)
+	defer C.free(unsafe.Pointer(cHome))
+	goHome := C.GoString(cHome)
+
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	id := session.NewID()
+	log, err := session.Create(filepath.Join(goHome, "sessions", id), session.Header{
+		ID:        id,
+		CreatedAt: time.Now().UnixMilli(),
+		CWD:       goHome,
+	})
+	if err != nil {
+		return C.jni_string(env, C.CString(`{"error":"`+err.Error()+`"}`))
+	}
+	sessions[id] = log
+	return C.jni_string(env, C.CString(sessionJSON(log, id)))
 }
