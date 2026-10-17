@@ -82,7 +82,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // Streaming markdown: the renderer advertises incremental streaming and
-    // full GFM, which is what a chat transcript needs (see ADR 0001).
-    implementation("com.mikepenz:multiplatform-markdown-renderer-android:0.34.0")
+    // Markdown is rendered by the in-repo renderer (Markdown.kt). The cached
+    // third-party renderer was built against a newer Compose foundation than
+    // this BOM and crashed with NoSuchMethodError on a real device.
 }

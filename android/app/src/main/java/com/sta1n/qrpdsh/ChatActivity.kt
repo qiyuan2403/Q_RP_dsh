@@ -17,7 +17,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -660,7 +662,11 @@ private fun DshApp(home: String) {
         },
     ) {
         Surface(Modifier.fillMaxSize(), color = dsw.bgBase) {
-            Column(Modifier.fillMaxSize().imePadding()) {
+            // Edge-to-edge is enforced at targetSdk 35: without consuming the
+            // insets the composer sits under the navigation bar and the top bar
+            // under the status bar. safeDrawing covers system bars, cutout and
+            // IME in one padding, so the keyboard cannot double it.
+            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                 Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { scope.launch { drawer.open() } }) { Icon(Icons.Default.Menu, "会话", tint = dsw.textPrimary) }
                     Text(selected?.title?.ifBlank { "新会话" } ?: "新会话", color = dsw.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)

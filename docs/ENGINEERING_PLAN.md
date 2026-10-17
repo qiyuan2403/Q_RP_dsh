@@ -130,13 +130,16 @@
 ### 阶段 3：Android 客户端
 
 - [x] 已接受 Compose/Kotlin + Go/JNI 架构决策。
-- [ ] 完成真实 Activity 启动和 Go library 加载。
-- [x] 按 DSH 用户流程完成会话列表、创建、打开、发送和工具交互：流式渲染、Markdown、可折叠工具卡、搜索 key 配置、取消按钮、跟随系统暗色；离线 Kotlin 编译通过，真机未验证。
-- [ ] 真机验收 UI：中文输入法、软键盘、旋转、后台恢复、流式观感、取消延迟、暗色状态栏。
+- [x] 完成真实 Activity 启动和 Go library 加载：真机冷启动成功，8 个 JNI 方法可用，会话/发送/取消均走通。
+- [x] 按 DSH 用户流程完成会话列表、创建、打开、发送和工具交互：流式渲染、Markdown、可折叠工具卡、搜索 key 配置、取消按钮、跟随系统暗色。
+- [x] 真机发现并修复两个问题：第三方 Markdown 渲染器与本项目 Compose BOM 不兼容导致每次渲染崩溃，改为仓库内自实现渲染器（Markdown.kt，支持标题/段落/代码块/列表/引用/粗斜体/行内代码/链接样式）；edge-to-edge 未消费 insets 导致输入区被导航栏遮挡，根布局改用 WindowInsets.safeDrawing。
+- [x] 真机验收（Redmi corot, Android 15, crDroid 11.9；APK 经 pm install 覆盖安装）：启动无崩溃、会话回放、真实 DeepSeek API 对话、流式生成中可见文字增长与停止键、Markdown（标题/列表/代码块/粗体/行内代码）、工具卡（成功与失败状态）、取消（状态显示已取消、日志 reason=cancelled）、设置对话框四项配置、跟随系统暗色、横屏旋转重建后回放，均通过。
+- [ ] 真机验收剩余项：工具卡展开点按（用户占用设备期间未测）、中文输入法实际输入（用 AOSP 键盘测的 ASCII）、搜索工具接真实搜索 key 的端到端调用、后台长时间运行与低内存回收。
 - [x] JNI 宿主在多轮会话中恢复模型侧历史：用日志中 `tool/result.text` + `agent.RebuildHistory` + `a.Seed`；含日志、web 工具与恢复历史的集成测试。
 - [x] Android 设备产物用最新源码重建：`android/jni/build.sh` 交叉编译 arm64 `libqrpdsh.so`（约 12.5 MB），`android/build.sh` 打包 APK（约 72.8 MiB），`apksigner verify` 通过，包内含 libqrpdsh/libnodebin/Node 资源/manifest；未上真机。
-- [ ] 验证原生 UI 消费 DSH 会话事件并正确恢复投影（服务端恢复已通，设备 UI 未验证）。
-- [ ] 完成中文输入、Markdown、滚动和文件访问。
+- [x] 验证原生 UI 消费 DSH 会话事件并正确恢复投影：真机重启 Activity 后从日志回放出完整会话，流式帧驱动直播段。
+- [x] 完成 Markdown、滚动、工具卡与文件访问（真机验证）。
+- [ ] 中文输入法实际输入（真机用 AOSP 键盘测的 ASCII，缺中文输入验证）。
 
 ### 阶段 4：Windows 客户端
 
@@ -153,5 +156,6 @@
 - [x] 完成 DSH 基座差异清单与插件映射，见 [DSH_COMPATIBILITY_MATRIX.md](DSH_COMPATIBILITY_MATRIX.md)、[PLUGIN_MAPPING.md](PLUGIN_MAPPING.md)。
 - [x] 内核登记 `web` 服务名，实现 Go 版 `web` 服务与 `tool-web` 等价工具，补插件注册表。
 - [ ] 把五个产品插件（card、cardgit、gallery、hubsync、imagegen）按 DSH 插件形状包装并接入 `plugins/builtin`，逐个验证配置、依赖与卸载。
-- [ ] 真机验证：安装新 APK、冷启动、会话列表、多轮对话恢复、流式显示与取消、Markdown/工具卡、web 工具联网与中文页面解码；`adb` 当前无设备。
+- [x] 真机验证（见阶段 3）：安装、冷启动、会话列表、多轮对话恢复、流式显示与取消、Markdown、工具卡、暗色、横屏。
+- [ ] 真机剩余：搜索工具端到端、中文输入法、工具卡展开点按、长时后台运行。
 - [ ] 接真实 DeepSeek 搜索 API 验证 `web_search`（需要 `DEEPSEEK_API_KEY`）。
