@@ -1,5 +1,6 @@
 package com.sta1n.qrpdsh.ui.theme
 
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.darkColorScheme
@@ -19,8 +20,13 @@ import com.sta1n.qrpdsh.ui.DswLight
  */
 val LocalDsw = staticCompositionLocalOf<Dsw> { DswLight }
 
+/**
+ * The DSW theme. The light/dark choice follows the system by default; the
+ * explicit [dark] parameter stays for previews and a future user override,
+ * which needs no other call-site change.
+ */
 @Composable
-fun DswTheme(dark: Boolean, content: @Composable () -> Unit) {
+fun DswTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
     val dsw = if (dark) DswDark else DswLight
     // Bridge the tokens Material actually reads. DSH controls are custom;
     // the Material defaults only need to not clash with the surface.
