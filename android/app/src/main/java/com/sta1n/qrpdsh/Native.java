@@ -68,4 +68,16 @@ public final class Native {
      * MUST be called off the UI thread; it blocks.
      */
     public static native String pollEvent(String sessionId, int timeoutMs);
+
+    /** Lists every session under home, newest first. Rows mirror the
+     * official SessionSummary: id/title/blank/running/updatedAt. */
+    public static native String listSessions(String home);
+
+    /** Opens one session by id and returns its replay document
+     * ({@code {"id","events":[...]}}), or {@code {"error"}}. */
+    public static native String openSessionId(String home, String id);
+
+    /** Starts a new blank session (the official startSession) and returns
+     * its replay document. */
+    public static native String createSession(String home);
 }

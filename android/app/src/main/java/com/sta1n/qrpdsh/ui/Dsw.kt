@@ -44,6 +44,9 @@ data class Dsw(
     // --dsw-specific-sidebar-fill: the sidebar column fill. Light bluish-50
     // #F9FAFB, dark bluish-900 #1B1B1C (design-platform.css:275/393).
     val sidebarFill: Color,
+    // --dsw-alias-interactive-bg-hover: row hover/selected fill.
+    // Light rgba(38,49,72,.06) → 0F314822 on white; dark rgba(255,255,255,.08).
+    val interactiveHover: Color,
     val buttonPrimaryFill: Color,
     val buttonPrimaryHover: Color,
     val buttonGhostActiveFill: Color,
@@ -89,6 +92,8 @@ val DswLight = Dsw(
     inputMajor = Color(0xFFFFFFFF),
     // bluish-50 rgb(249,250,251)
     sidebarFill = Color(0xFFF9FAFB),
+    // rgba(38,49,72,0.06) over the base surface
+    interactiveHover = Color(0x0F263148),
 )
 
 /** The dark theme: the token values the official dark build ships. */
@@ -118,6 +123,8 @@ val DswDark = DswLight.copy(
     inputMajor = Color(0xFF2C2C2E),
     // bluish-900 rgb(27,27,28)
     sidebarFill = Color(0xFF1B1B1C),
+    // rgba(255,255,255,0.08)
+    interactiveHover = Color(0x14FFFFFF),
 )
 
 /**

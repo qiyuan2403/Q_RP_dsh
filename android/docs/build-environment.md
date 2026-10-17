@@ -86,8 +86,9 @@ cd android
 ./build.sh
 ```
 
-The script compiles the Go harness as a shared library for `android/arm64`,
-then runs the standard `aapt2` → `d8` → `zipalign` → `apksigner` chain.
+The script compiles the Go harness as an `android/arm64` shared library, stages
+the JNI and Node runtime artifacts in the app's standard source directories,
+then runs Gradle's `:app:assembleDebug` task for the Compose application.
 
 ## Why the harness is a shared library
 

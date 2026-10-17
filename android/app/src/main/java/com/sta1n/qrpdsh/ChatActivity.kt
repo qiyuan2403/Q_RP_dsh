@@ -2,324 +2,339 @@ package com.sta1n.qrpdsh
 
 import android.content.Context
 import android.os.Bundle
-import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextButton
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.runtime.remember
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.lifecycle.lifecycleScope
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.sta1n.qrpdsh.ui.Dsw
-import com.sta1n.qrpdsh.ui.DswDark
-import com.sta1n.qrpdsh.ui.DswLight
-import com.sta1n.qrpdsh.ui.conversation.ConversationRoot
-import com.sta1n.qrpdsh.ui.conversation.ChatView
-import com.sta1n.qrpdsh.ui.layout.AppFrame
-import com.sta1n.qrpdsh.ui.sidebar.SessionRowUi
-import com.sta1n.qrpdsh.ui.sidebar.SidebarRoot
+import com.sta1n.qrpdsh.ui.theme.DswTheme
+import com.sta1n.qrpdsh.ui.theme.LocalDsw
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.IOException
 
-/**
- * The activity shell. All UI lives in the ui.* packages, layered like the
- * official client (layout / sidebar / conversation); this class owns only
- * the data path: session open/replay, turn dispatch, the live event poll,
- * and the settings persistence.
- */
+private const val SETTINGS_NAME = "connection"
+private const val KEY_BASE_URL = "baseUrl"
+private const val KEY_API_KEY = "apiKey"
+private const val KEY_MODEL = "model"
+
+private data class ConnectionSettings(val baseUrl: String, val apiKey: String, val model: String)
+
+data class SessionRow(val id: String, val title: String, val blank: Boolean, val running: Boolean, val updatedAt: Long)
+data class ChatItem(val seq: Long, val kind: String, val text: String, val name: String = "", val error: Boolean = false)
+
+private fun loadSettings(context: Context): ConnectionSettings {
+    val prefs = context.getSharedPreferences(SETTINGS_NAME, Context.MODE_PRIVATE)
+    return ConnectionSettings(
+        prefs.getString(KEY_BASE_URL, "https://api.deepseek.com/v1") ?: "",
+        prefs.getString(KEY_API_KEY, "") ?: "",
+        prefs.getString(KEY_MODEL, "deepseek-chat") ?: "deepseek-chat",
+    )
+}
+
+private fun saveSettings(context: Context, settings: ConnectionSettings) {
+    context.getSharedPreferences(SETTINGS_NAME, Context.MODE_PRIVATE).edit()
+        .putString(KEY_BASE_URL, settings.baseUrl.trim())
+        .putString(KEY_API_KEY, settings.apiKey)
+        .putString(KEY_MODEL, settings.model.trim())
+        .apply()
+}
+
+private fun parseSessions(raw: String): List<SessionRow> = runCatching {
+    val array = JSONArray(raw)
+    List(array.length()) { index ->
+        val row = array.getJSONObject(index)
+        SessionRow(row.optString("id"), row.optString("title"), row.optBoolean("blank"), row.optBoolean("running"), row.optLong("updatedAt"))
+    }
+}.getOrDefault(emptyList())
+
+private fun parseReplay(raw: String): Triple<String, List<ChatItem>, String?> = runCatching {
+    val root = JSONObject(raw)
+    val events = root.optJSONArray("events") ?: JSONArray()
+    val output = ArrayList<ChatItem>(events.length())
+    for (index in 0 until events.length()) {
+        val event = events.getJSONObject(index)
+        val data = event.optJSONObject("data") ?: JSONObject()
+        val item = when (event.optString("type")) {
+            "user/message" -> ChatItem(event.optLong("seq"), "user", data.optString("text"))
+            "assistant/message" -> ChatItem(event.optLong("seq"), "assistant", data.optString("text"))
+            "tool/call" -> ChatItem(event.optLong("seq"), "tool", data.optString("name"), data.optString("name"))
+            "tool/result" -> ChatItem(event.optLong("seq"), "tool-result", data.optString("output", data.optString("error")), data.optString("name"), data.has("error"))
+            else -> null
+        }
+        if (item != null && (item.text.isNotBlank() || item.kind == "tool")) output += item
+    }
+    Triple(root.optString("id"), output, root.optString("error").takeIf(String::isNotBlank))
+}.getOrElse { Triple("", emptyList(), it.message ?: "无法读取会话") }
+
 class ChatActivity : ComponentActivity() {
-    private val tag = "qrpdsh"
-
-    private var sessionId by mutableStateOf<String?>(null)
-    private val rows = mutableStateListOf<ChatRow>()
-    private var nodeExecutable by mutableStateOf<String?>(null)
-    private var turnRunning by mutableStateOf(false)
-    private var showSettings by mutableStateOf(false)
-    private var sidebarOpen by mutableStateOf(false)
-    private var config by mutableStateOf(Config.EMPTY)
-    private var dsw: Dsw = DswLight
-
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        config = Config.load(this)
-        dsw = if (isDarkTheme()) DswDark else DswLight
-        setContent { Root() }
+        val home = filesDir.absolutePath
+        setContent { DswTheme(dark = false) { DshApp(home) } }
+    }
+}
 
-        lifecycleScope.launch(Dispatchers.IO) {
-            val node = try {
-                NodeRuntime.materialize(applicationContext)
-            } catch (e: IOException) {
-                null
-            } catch (t: Throwable) {
-                Log.e(tag, "node materialize failed", t)
-                null
-            }
-            withContext(Dispatchers.Main) { nodeExecutable = node }
-            val session = Native.openSession(getFilesDir().absolutePath)
-            withContext(Dispatchers.Main) { applySession(session) }
+@Composable
+private fun DshApp(home: String) {
+    val context = LocalContext.current
+    val activity = context as ChatActivity
+    val dsw = LocalDsw.current
+    val scope = rememberCoroutineScope()
+    val drawer = rememberDrawerState(DrawerValue.Closed)
+    var settings by remember { mutableStateOf(loadSettings(context)) }
+    var showSettings by remember { mutableStateOf(false) }
+    var sessions by remember { mutableStateOf(emptyList<SessionRow>()) }
+    var selected by remember { mutableStateOf<SessionRow?>(null) }
+    var messages by remember { mutableStateOf(emptyList<ChatItem>()) }
+    var input by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf<String?>(null) }
+
+    fun openSession(row: SessionRow) {
+        selected = row
+        scope.launch(Dispatchers.IO) {
+            val replay = parseReplay(Native.openSessionId(home, row.id))
+            withContext(Dispatchers.Main) { messages = replay.second; status = replay.third }
         }
     }
 
-    @Composable
-    private fun Root() {
-        // The frame owns the column solve; the phone keeps the drawer.
-        AppFrame(
-            dsw = dsw,
-            sidebar = { collapsed, onToggle ->
-                SidebarRoot(
-                    dsw = dsw,
-                    sessions = listOf(
-                        SessionRowUi(
-                            id = sessionId ?: "",
-                            title = "Current session",
-                            running = turnRunning,
-                        ),
-                    ),
-                    currentId = sessionId,
-                    onSelect = { },
-                    onNewSession = { onNewSession() },
-                    collapsed = collapsed,
-                    onToggle = onToggle,
-                    version = "",
-                )
-            },
-            center = {
-                ConversationRoot(
-                    dsw = dsw,
-                    title = "Current session",
-                    sidebarToggle = { sidebarOpen = true },
-                ) {
-                    ChatView(dsw, rows, turnRunning) { send(it) }
+    fun refresh() {
+        scope.launch(Dispatchers.IO) {
+            val rows = parseSessions(Native.listSessions(home))
+            val replay = if (selected == null) parseReplay(Native.openSession(home)) else null
+            withContext(Dispatchers.Main) {
+                sessions = rows
+                if (replay != null && replay.first.isNotEmpty()) {
+                    selected = rows.firstOrNull { it.id == replay.first } ?: SessionRow(replay.first, "", true, false, 0L)
+                    messages = replay.second
+                    status = replay.third
                 }
-            },
-        )
-        if (showSettings) {
-            SettingsSheet(config) { updated ->
-                config = updated
-                updated.save(this)
-                showSettings = false
             }
         }
     }
 
-    private fun onNewSession() {
-        // Close the current session and open a fresh one.
-        val sid = sessionId ?: return
-        lifecycleScope.launch(Dispatchers.IO) {
-            Native.closeSession(sid)
-            val session = Native.openSession(getFilesDir().absolutePath)
-            withContext(Dispatchers.Main) { applySession(session) }
+    fun createSession() {
+        scope.launch(Dispatchers.IO) {
+            val replay = parseReplay(Native.createSession(home))
+            withContext(Dispatchers.Main) {
+                if (replay.first.isNotEmpty()) {
+                    selected = SessionRow(replay.first, "", true, false, System.currentTimeMillis())
+                    sessions = parseSessions(Native.listSessions(home))
+                    messages = replay.second
+                    status = replay.third
+                } else status = replay.third
+                scope.launch { drawer.close() }
+            }
         }
     }
 
-    private fun applySession(document: String) {
-        try {
-            val obj = JSONObject(document)
-            if (obj.has("error")) {
-                toast("session open failed: " + obj.getString("error"))
-                return
-            }
-            sessionId = obj.getString("id")
-            rows.clear()
-            val events = obj.optJSONArray("events") ?: JSONArray()
-            for (i in 0 until events.length()) {
-                project(events.getJSONObject(i))?.let { rows.add(it) }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "session replay failed", e)
-            toast("session replay failed: " + e.message)
-        }
-    }
-
-    private fun send(task: String) {
-        val sid = sessionId ?: return
-        if (turnRunning || task.isBlank()) return
-        val cfg = config
-        if (cfg.apiKey.isBlank()) {
-            toast("set a base URL, API key, and model in settings first")
+    fun send() {
+        val task = input.trim()
+        val sessionId = selected?.id ?: return
+        if (task.isEmpty() || busy) return
+        if (settings.baseUrl.isBlank() || settings.model.isBlank()) {
+            status = "请先配置 API 地址和模型"
             showSettings = true
             return
         }
-        turnRunning = true
-        rows.add(ChatRow.User(task))
-        val node = nodeExecutable
-        lifecycleScope.launch(Dispatchers.IO) {
-            val poller = launch {
-                while (true) {
-                    val raw = try {
-                        Native.pollEvent(sid, 250)
-                    } catch (t: Throwable) {
-                        Log.e(tag, "pollEvent failed", t)
-                        break
-                    }
-                    if (raw.isEmpty()) continue
-                    val row = try {
-                        project(JSONObject(raw))
-                    } catch (e: Exception) {
-                        null
-                    }
-                    withContext(Dispatchers.Main) { row?.let { rows.add(it) } }
-                }
+        input = ""
+        busy = true
+        status = null
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val nodePath = runCatching { NodeRuntime.materialize(activity) }.getOrNull()
+                val response = JSONObject(Native.runTurn(task, home, home, settings.baseUrl, settings.apiKey, settings.model, nodePath, sessionId))
+                response to parseReplay(Native.openSessionId(home, sessionId))
             }
-            val result = try {
-                Native.runTurn(task, getFilesDir().absolutePath, getFilesDir().absolutePath,
-                        cfg.baseUrl, cfg.apiKey, cfg.model, node, sid)
-            } catch (t: Throwable) {
-                Log.e(tag, "runTurn threw", t)
-                "{\"error\":\"" + t.message + "\"}"
-            }
-            poller.cancel()
             withContext(Dispatchers.Main) {
-                turnRunning = false
-                applyResult(result)
-            }
-        }
-    }
-
-    private fun applyResult(result: String) {
-        try {
-            val obj = JSONObject(result)
-            if (obj.has("error")) {
-                rows.add(ChatRow.Error(obj.getString("error")))
-            }
-        } catch (e: Exception) {
-            rows.add(ChatRow.Error(result))
-        }
-    }
-
-    private fun project(e: JSONObject): ChatRow? {
-        return when (e.optString("type")) {
-            "user/message" -> {
-                val data = e.optJSONObject("data")
-                ChatRow.User(data?.optString("text") ?: "")
-            }
-            "assistant/message" -> {
-                val data = e.optJSONObject("data")
-                val text = data?.optString("text") ?: ""
-                val calls = data?.optJSONArray("toolCalls")
-                if (calls != null && calls.length() > 0) {
-                    val names = (0 until calls.length()).mapNotNull { i ->
-                        calls.optJSONObject(i)?.optString("name")
-                    }
-                    ChatRow.AssistantWithTools(text, names)
-                } else {
-                    ChatRow.Assistant(text)
-                }
-            }
-            "tool/call" -> {
-                val data = e.optJSONObject("data")
-                ChatRow.ToolCall(data?.optString("name") ?: "?", data?.optString("arguments") ?: "")
-            }
-            "tool/result" -> {
-                val data = e.optJSONObject("data")
-                val err = data?.optString("error", "") ?: ""
-                ChatRow.ToolResult(data?.optString("name") ?: "?", data?.optString("output") ?: "", err)
-            }
-            else -> null
-        }
-    }
-
-    private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-    }
-
-    private fun isDarkTheme(): Boolean {
-        val mode = resources.configuration.uiMode and
-                android.content.res.Configuration.UI_MODE_NIGHT_MASK
-        return mode == android.content.res.Configuration.UI_MODE_NIGHT_YES
-    }
-
-    /** Connection settings for turns, persisted in SharedPreferences. */
-    data class Config(
-        val baseUrl: String,
-        val apiKey: String,
-        val model: String,
-    ) {
-        fun save(context: Context) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString("baseUrl", baseUrl)
-                .putString("apiKey", apiKey)
-                .putString("model", model)
-                .apply()
-        }
-        companion object {
-            private const val PREFS = "qrpdsh"
-            val EMPTY = Config("", "", "")
-            fun load(context: Context): Config {
-                val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                return Config(
-                    baseUrl = p.getString("baseUrl", "https://api.deepseek.com/v1") ?: "",
-                    apiKey = p.getString("apiKey", "") ?: "",
-                    model = p.getString("model", "deepseek-chat") ?: "",
+                result.fold(
+                    onSuccess = { (response, replay) ->
+                        messages = replay.second
+                        status = replay.third ?: response.optString("error").takeIf(String::isNotBlank)
+                        busy = false
+                        sessions = parseSessions(Native.listSessions(home))
+                    },
+                    onFailure = { error -> status = error.message ?: "请求失败"; busy = false },
                 )
             }
         }
     }
-}
 
-/** One rendered row of the conversation; the projection type shared with the ui layer. */
-sealed class ChatRow {
-    data class User(val text: String) : ChatRow()
-    data class Assistant(val text: String) : ChatRow()
-    data class AssistantWithTools(val text: String, val toolNames: List<String>) : ChatRow()
-    data class ToolCall(val name: String, val arguments: String) : ChatRow()
-    data class ToolResult(val name: String, val output: String, val error: String) : ChatRow()
-    data class Error(val text: String) : ChatRow()
-}
+    LaunchedEffect(Unit) { refresh() }
 
+    if (showSettings) {
+        ConnectionDialog(settings, dsw, onDismiss = { showSettings = false }) { updated ->
+            saveSettings(context, updated)
+            settings = updated
+            showSettings = false
+            status = null
+        }
+    }
 
-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
-@Composable
-private fun SettingsSheet(current: ChatActivity.Config, onSave: (ChatActivity.Config) -> Unit) {
-    ModalBottomSheet(onDismissRequest = { onSave(current) }) {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Settings", fontSize = 16.sp)
-            LabeledField("Base URL", current.baseUrl) { onSave(ChatActivity.Config(it, current.apiKey, current.model)) }
-            LabeledField("API key", current.apiKey) { onSave(ChatActivity.Config(current.baseUrl, it, current.model)) }
-            LabeledField("Model", current.model) { onSave(ChatActivity.Config(current.baseUrl, current.apiKey, it)) }
-            TextButton(
-                onClick = { },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Done") }
-            androidx.compose.foundation.layout.Box(Modifier.navigationBarsPadding())
+    ModalNavigationDrawer(
+        drawerState = drawer,
+        drawerContent = {
+            ModalDrawerSheet(drawerContainerColor = dsw.sidebarFill) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("会话", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = dsw.textPrimary)
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "设置", tint = dsw.textPrimary) }
+                    IconButton(onClick = { createSession() }) { Icon(Icons.Default.Add, "新建", tint = dsw.textPrimary) }
+                }
+                LazyColumn(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
+                    items(sessions, key = { it.id }) { row ->
+                        val active = selected?.id == row.id
+                        Row(
+                            Modifier.fillMaxWidth().height(32.dp)
+                                .background(if (active) dsw.interactiveHover else Color.Transparent, RoundedCornerShape(8.dp))
+                                .clickable { openSession(row); scope.launch { drawer.close() } }
+                                .padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (row.running) Box(Modifier.size(7.dp).background(Color(0xFF22C55E), RoundedCornerShape(4.dp))) else Spacer(Modifier.size(7.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (row.blank) "新会话" else row.title.ifBlank { "未命名" }, maxLines = 1, color = dsw.textPrimary, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        },
+    ) {
+        Surface(Modifier.fillMaxSize(), color = dsw.bgBase) {
+            Column(Modifier.fillMaxSize().imePadding()) {
+                Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { scope.launch { drawer.open() } }) { Icon(Icons.Default.Menu, "会话", tint = dsw.textPrimary) }
+                    Text(selected?.title?.ifBlank { "新会话" } ?: "新会话", color = dsw.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "设置", tint = dsw.textPrimary) }
+                }
+                if (status != null) Text(status!!, Modifier.fillMaxWidth().padding(horizontal = 16.dp), color = dsw.textSecondary, fontSize = 12.sp)
+                val listState = rememberLazyListState()
+                LazyColumn(
+                    Modifier.weight(1f).fillMaxWidth(),
+                    state = listState,
+                    contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(messages, key = { it.seq }) { item -> MessageRow(item, dsw) }
+                    if (busy) item {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = dsw.brandPrimary)
+                            Spacer(Modifier.width(8.dp))
+                            Text("正在思考", color = dsw.textSecondary, fontSize = 13.sp)
+                        }
+                    }
+                }
+                Composer(input, { input = it }, ::send, busy, dsw)
+            }
         }
     }
 }
 
 @Composable
-private fun LabeledField(label: String, value: String, onChange: (String) -> Unit) {
-    var text by mutableStateOf(value)
-    Column {
-        Text(label, fontSize = 12.sp)
-        TextField(
-            value = text,
-            onValueChange = { text = it; onChange(it) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+private fun ConnectionDialog(initial: ConnectionSettings, dsw: Dsw, onDismiss: () -> Unit, onSave: (ConnectionSettings) -> Unit) {
+    var baseUrl by remember(initial) { mutableStateOf(initial.baseUrl) }
+    var apiKey by remember(initial) { mutableStateOf(initial.apiKey) }
+    var model by remember(initial) { mutableStateOf(initial.model) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("模型连接", color = dsw.textPrimary) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(baseUrl, { baseUrl = it }, label = { Text("API 地址") }, singleLine = true)
+                OutlinedTextField(apiKey, { apiKey = it }, label = { Text("API 密钥") }, singleLine = true, visualTransformation = PasswordVisualTransformation())
+                OutlinedTextField(model, { model = it }, label = { Text("模型") }, singleLine = true)
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(ConnectionSettings(baseUrl, apiKey, model)) }) { Text("保存") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun MessageRow(item: ChatItem, dsw: Dsw) {
+    val user = item.kind == "user"
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = if (user) Alignment.End else Alignment.Start) {
+        if (item.kind == "tool" || item.kind == "tool-result") {
+            Row(Modifier.fillMaxWidth().padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.width(2.dp).height(28.dp).background(dsw.borderL2))
+                Spacer(Modifier.width(10.dp))
+                Text(if (item.kind == "tool") "工具 · ${item.name}" else "${item.name} · ${item.text}", color = if (item.error) dsw.danger else dsw.textSecondary, fontSize = 12.sp)
+            }
+        } else {
+            Surface(color = if (user) dsw.bubble else Color.Transparent, shape = RoundedCornerShape(20.dp)) {
+                Text(item.text, Modifier.padding(horizontal = 16.dp, vertical = 10.dp), color = dsw.textPrimary, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Composer(value: String, onValue: (String) -> Unit, send: () -> Unit, busy: Boolean, dsw: Dsw) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.Bottom) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValue,
+            modifier = Modifier.weight(1f),
+            placeholder = { Text("输入消息", color = dsw.textTertiary) },
+            shape = RoundedCornerShape(28.dp),
+            maxLines = 5,
         )
+        Spacer(Modifier.width(8.dp))
+        IconButton(onClick = send, enabled = !busy && value.isNotBlank()) {
+            Icon(Icons.Default.Send, "发送", tint = dsw.brandPrimary)
+        }
     }
 }
