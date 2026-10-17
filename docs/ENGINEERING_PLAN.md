@@ -79,6 +79,8 @@
 - [x] Session v4 存储实现的现状与约束，见 [ADR 0002](decisions/0002-session-event-contract.md)；其与完整 DSH 行为的一致性仍需逐项验证。
 - [ ] Go-Kotlin 事件传输与线程调度合同。
 - [ ] DSH Agent 流式调用及 UI 增量更新的语义映射；Go 已支持 OpenAI-compatible SSE provider 和增量 tool-call 拼装，但 Agent 当前在最终 assistant 消息提交前只收集增量，尚未发布官方 `assistant-stream` 临时帧。
+- [x] Web seam 合同：provider 注册与执行期选择、5 个上游错误码、`capSources` 截断，见 `web/` 包；已知取舍记在 [PLUGIN_MAPPING.md](PLUGIN_MAPPING.md)。
+- [x] `tool/result` 持久化模型可见文本，恢复优先使用文本；见 [ADR 0002](decisions/0002-session-event-contract.md)。
 - [ ] DSH 插件注册、依赖和权限语义映射。
 - [ ] Android 首发支持的 DSH 行为清单。
 
@@ -91,6 +93,7 @@
 - [x] 干净构建验证：从 GitHub 全新 clone、清空 `GOMODCACHE`、`GOPROXY=direct`，`go build ./...`、`go test ./...`、`android/jni` 的 `go build ./...` 均通过。
 - [ ] 插件仓库无版本标签（HEAD `dab356a`），主仓库尚未依赖它；插件接入前需要一个可拉取的模块版本。
 - [ ] Go 模块代理在当前网络不可达（`proxy.golang.org`、`goproxy.cn` 均无响应），干净构建需 `GOPROXY=direct` 或配置可用代理。
+- [ ] 提交后重做干净 clone 验证：新增 `golang.org/x/text` 依赖，需确认 `go.sum` 在空模块缓存下可解析。
 
 ## 阶段
 
@@ -108,6 +111,9 @@
 - [x] Cordis/Loader、Agent、Session、Tools 已有 Go 实现基础。
 - [ ] 用 DSH 官方样本验证 profile/bundle 装载结果。
 - [x] 验证 Go Agent 的基础流式响应路径：SSE 文本增量、分段 tool-call 参数拼装和既有工具回合继续。
+- [x] 移植 DSH web 能力层：`web` seam、`tool-web` 工具、`web-fetch-http` 与 `web-search-deepseek` provider、官方行名到 Go 插件体的映射；见 [PLUGIN_MAPPING.md](PLUGIN_MAPPING.md)。测试覆盖选择规则、SSRF 策略、重定向、大小上限、响应映射与插件行生命周期；未接真实 API、未上真机。
+- [x] 工具模型可见输出与会话恢复一致：`tool/result` 同时保存结构化 `output` 与模型可见 `text`，恢复优先用 `text`；旧日志回退到 `tools.Tool.Render` 投影。`Render` 的契约（旧日志需接受 JSON 解码形状）已写入 `tools.Tool` 文档。
+- [x] web fetch 解码与重定向对齐：`htmlindex` 支持 GBK/GB18030/Big5/Shift_JIS/EUC/UTF-16/windows-125x；`maxRedirects: 0` 表达不跟随重定向；新增 `golang.org/x/text v0.41.0` 依赖（仅 `web/httpfetch` 使用）。
 - [ ] 验证 DSH Agent 的官方 assistant-stream 临时帧、错误/取消结算和 UI 增量更新语义。
 - [ ] 验证 DSH Session 读写、恢复和投影行为。
 - [ ] 验证无 Node 时的 DSH 核心功能边界。
@@ -126,7 +132,9 @@
 - [x] 已接受 Compose/Kotlin + Go/JNI 架构决策。
 - [ ] 完成真实 Activity 启动和 Go library 加载。
 - [ ] 按 DSH 用户流程完成会话列表、创建、打开、发送和工具交互。
-- [ ] 验证原生 UI 消费 DSH 会话事件并正确恢复投影。
+- [x] JNI 宿主在多轮会话中恢复模型侧历史：用日志中 `tool/result.text` + `agent.RebuildHistory` + `a.Seed`；含日志、web 工具与恢复历史的集成测试。
+- [x] Android 设备产物用最新源码重建：`android/jni/build.sh` 交叉编译 arm64 `libqrpdsh.so`（约 12.5 MB），`android/build.sh` 打包 APK（约 72.8 MiB），`apksigner verify` 通过，包内含 libqrpdsh/libnodebin/Node 资源/manifest；未上真机。
+- [ ] 验证原生 UI 消费 DSH 会话事件并正确恢复投影（服务端恢复已通，设备 UI 未验证）。
 - [ ] 完成中文输入、Markdown、滚动和文件访问。
 
 ### 阶段 4：Windows 客户端
@@ -142,4 +150,7 @@
 - [x] 固定上游 DSH 版本与行为基线：`0.2.1-alpha.4` / `86a402200d95fecef4529d969836f1fe13c6cb0d`。
 - [ ] 冻结 JNI 传输合同。
 - [x] 完成 DSH 基座差异清单与插件映射，见 [DSH_COMPATIBILITY_MATRIX.md](DSH_COMPATIBILITY_MATRIX.md)、[PLUGIN_MAPPING.md](PLUGIN_MAPPING.md)。
-- [ ] 接入并验证内置插件：内核登记 `web` 服务名，实现 Go 版 `web` 服务与 `tool-web` 等价工具，补插件注册表。
+- [x] 内核登记 `web` 服务名，实现 Go 版 `web` 服务与 `tool-web` 等价工具，补插件注册表。
+- [ ] 把五个产品插件（card、cardgit、gallery、hubsync、imagegen）按 DSH 插件形状包装并接入 `plugins/builtin`，逐个验证配置、依赖与卸载。
+- [ ] 真机验证：安装新 APK、冷启动、会话列表、多轮对话恢复、web 工具联网与中文页面解码；`adb` 当前无设备。
+- [ ] 接真实 DeepSeek 搜索 API 验证 `web_search`（需要 `DEEPSEEK_API_KEY`）。

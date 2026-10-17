@@ -42,7 +42,7 @@
 |---|---|---|---|
 | 格式版本和 envelope | `packages/core/session/src/types.ts` (`SESSION_FORMAT_VERSION`, `SessionEvent`) | v4；`type/seq/time/data/ignorable/surfaceOp/sourceEventSeqs` 字段有对应 | [ ] 用官方生成样本比较编码、缺省字段、字段拒绝与跨实现 round-trip |
 | 事件名称 | `packages/core/session/src/known-event-types.ts` | `session/vocabulary.go` 当前名称集相符 | [ ] 机械集合差异检查加入 CI，防上游变化漏同步 |
-| Agent durable 事件 | `packages/core/session/src/types.ts`、`packages/core/agent-loop/src/agent.ts` | Go 写入基础 user/turn/step/assistant/tool 事件 | [ ] 逐事件 payload、序号、时间和失败/取消路径对照 |
+| Agent durable 事件 | `packages/core/session/src/types.ts`、`packages/core/agent-loop/src/agent.ts` | Go 写入基础 user/turn/step/assistant/tool 事件；`tool/result` 在 `output` 之外保存模型可见 `text`，恢复优先使用它 | [ ] 逐事件 payload、序号、时间和失败/取消路径对照 |
 | 临时 stream 帧 | `packages/core/agent-loop/src/assistant-stream.ts` | Go 当前未发布等价帧 | [ ] 实现并覆盖 start/chunk/end 及 abandoned/committed 终态 |
 | Session surface/projection | `packages/core/session/src/surface.ts`、`types.ts` | Go event envelope 可保存 surface 元数据；重放/UI投影覆盖面有限 | [ ] 对照 append/replace、source seq、image/offload 解释和恢复结果 |
 | 损坏/中断恢复 | `packages/core/session/src/repair.ts`、`preparation.ts` | Go 可拒绝格式不匹配、非单调序号；没有证据证明 repair 行为等价 | [ ] 官方故障样本驱动的兼容测试 |

@@ -54,8 +54,33 @@ Go 现状：
 5. 插件注册表：`runtime` 按行名映射到 `cordis.Plugin`，替换 `loadRow` 里的空 `Apply`。
 6. 其余五个产品插件按同形状包装，逐个接入并验证配置、依赖和卸载。
 
+## 四、web 能力层移植（已完成第一版）
+
+上游 `packages/web/` 的四层已有 Go 对应实现。全部在 Go 原生进程内执行，不经过 Node/JS，设备端不为联网工具额外启动进程。
+
+| 上游包 | Go 实现 | 状态与证据 |
+|---|---|---|
+| `@deepseek-ai/dsh-web` | `web/` | provider 注册、执行期六条选择规则、`capSources`、5 个上游错误码。只读审计确认正常输入域与上游一致；已知取舍见下 |
+| `@deepseek-ai/dsh-web-fetch-http` | `web/httpfetch/` | 公网地址策略（拒绝 loopback/私网/link-local 等）、同源重定向上限（`maxRedirects: 0` 可表达“不跟随”）、响应字节与字符上限、content-type 分类、`htmlindex` charset 解码（GBK/GB18030/Big5/Shift_JIS/EUC/UTF-16/windows-125x）；httptest 覆盖，无外网请求 |
+| `@deepseek-ai/dsh-web-search-deepseek` | `web/deepseeksearch/` | Anthropic 兼容 Messages + `web_search_20250305` server tool；`DEEPSEEK_API_KEY` 鉴权；`Available()` 纯本地检查 |
+| `@deepseek-ai/dsh-tool-web` | `tools/web/` | `web_fetch`、`web_search` 的工具名、参数 schema、模型可见渲染与截断、按可见工具挂载的 prompt 分段（search 文案随 web_fetch 是否存在切换）；单查询直接透传，多查询才加 `### query` 合并；渲染同时接受 Go 值与日志解码形状 |
+| 四个官方行名 | `plugins/builtin/` | 行名到 Go 插件体的映射；provider 行经 `ctx.Fiber().Effect` 注册，随行卸载撤销 |
+
+有意取舍（已写进代码注释）：
+
+- `web.Config` 空串按未配置处理并回退 `DSH_WEB_*_PROVIDER`。上游把显式空串当已配置的空 id 报错；Go 的 env 读不到“未设置/空串”的区别，产品上未配置也应自动选择。
+- `SearchRequest.MaxResults <= 0` 表示不限。Go 没有可选值；工具层拒绝非正整数，所以模型路径不触发。
+- HTML 转文本是简化实现，不是上游的 turndown Markdown：链接目标、标题级别、表格结构会丢，深度超限时输出省略标记。
+- charset 解码依赖 `golang.org/x/text/encoding/htmlindex`，覆盖 WHATWG 常用编码（GBK、GB18030、Big5、Shift_JIS、EUC-JP/KR、UTF-16、windows-125x、ISO-8859 系列）。仍存差异：Node 的 TextDecoder 拒收的少数标签（`replacement`、`iso-2022-cn*`、`iso-2022-kr` 等）在 Go 侧会被 htmlindex 接受；字符上限按 Unicode code point 计，上游按 UTF-16 code unit，astral 字符边界会差 1。
+- `web-fetch-http` 未移植 NAT64 前缀发现（`ipv4only.arpa`）与 http-proxy 集成；已知 NAT64 前缀、6to4、Teredo 等网段仍按地址分类拒绝。
+- `tool-web` 的 `inject` 不含上游的 `systemPrompt`：Go 的提示词不是服务，由装配方按实际注册的工具调用 `toolweb.AttachPromptSectionsFor`。
+- 模型可见工具文本写入 `tool/result` 的 `text` 字段并优先用于恢复，见 [ADR 0002](decisions/0002-session-event-contract.md)。
+- `FetchBody.Kind` 是字符串常量而非封闭类型；运行期不校验，合法 provider 行为一致。
+- DeepSeek 搜索未移植账户 token 鉴权与会话日志回调；`apiKey` 在构造时快照，不随轮换更新。
+- 未移植 `web-search-exa`、`web-search-perplexity`。它们是上游可选 provider，Android 首发是否需要待定。
+
 ## 未验证
 
-- 上游工具 schema 的逐字段移植：本表只核对到工具名、注入服务名和分层归属。
+- `web/`、`tools/web/`、`plugins/builtin` 的端到端只在测试与本机 CLI 验证：未在 Android 真机、未接真实 DeepSeek 搜索 API 验证。
 - 五个产品插件对应的 DSH 配置字段：需要先定它们各自必须暴露的工具和配置，属于产品决策，未开始。
 - npm 插件在设备上的加载：仍按工程计划标为未完成。
