@@ -41,6 +41,12 @@ type Tool struct {
 	// Run performs the call. A returned error becomes the tool result the model
 	// sees, so a failure is reported to the model rather than aborting the turn.
 	Run func(ctx context.Context, args json.RawMessage) (any, error)
+	// Render turns the tool's structured result into the model-facing text.
+	// Nil means the result is JSON-encoded, which is the historical behavior.
+	// It is separate from Run because the same value serves the session log
+	// (structured) and the model (rendered), and a tool that returns a rich
+	// structure should not force the model to read JSON.
+	Render func(value any) string
 }
 
 // Registry holds the available tools.

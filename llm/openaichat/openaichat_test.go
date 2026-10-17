@@ -241,3 +241,39 @@ func TestCompleteSendsToolResultsBack(t *testing.T) {
 		t.Fatalf("tool message = %v", toolMsg)
 	}
 }
+
+func TestStreamEmitsTextAndAssemblesToolCallDeltas(t *testing.T) {
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/x\\\"}\"}}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+	var chunks []llm.StreamChunk
+	err := New(Config{BaseURL: srv.URL}).Stream(context.Background(), llm.Request{Model: "m"}, func(chunk llm.StreamChunk) error {
+		chunks = append(chunks, chunk)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if payload["stream"] != true {
+		t.Fatalf("stream = %v, want true", payload["stream"])
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("got %d chunks, want 3", len(chunks))
+	}
+	if chunks[0].TextDelta != "hel" {
+		t.Fatalf("text delta = %q", chunks[0].TextDelta)
+	}
+	if chunks[1].ToolCallDelta == nil || chunks[1].ToolCallDelta.ID != "c1" || chunks[1].ToolCallDelta.Name != "read" {
+		t.Fatalf("first tool delta = %+v", chunks[1].ToolCallDelta)
+	}
+	if chunks[2].ToolCallDelta == nil || chunks[2].ToolCallDelta.ArgumentsDelta != "\"/x\"}" {
+		t.Fatalf("second tool delta = %+v", chunks[2].ToolCallDelta)
+	}
+}

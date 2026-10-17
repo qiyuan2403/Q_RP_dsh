@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -162,6 +164,106 @@ func TestTurnRunsToolsAndContinues(t *testing.T) {
 	}
 }
 
+// TestToolRenderShapesModelVisibleText pins the two audiences of one result:
+// the model reads the tool's rendered text while the session log keeps the
+// structured value. A tool that renders must not force the model to parse JSON,
+// and rendering must not change what is persisted.
+func TestToolRenderShapesModelVisibleText(t *testing.T) {
+	const rendered = "Sources:\n- [Example](https://example.com)"
+	registry := tools.NewRegistry()
+	if err := registry.Register(tools.Tool{
+		Name:        "search",
+		Description: "search the web",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return map[string]any{
+				"sources": []map[string]any{{"url": "https://example.com", "title": "Example"}},
+			}, nil
+		},
+		Render: func(value any) string {
+			if _, ok := value.(map[string]any); !ok {
+				t.Errorf("Render got %T, want the structured value", value)
+			}
+			return rendered
+		},
+	}); err != nil {
+		t.Fatalf("Register(search): %v", err)
+	}
+	if err := registry.Register(tools.Tool{
+		Name:       "plain",
+		Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return map[string]any{"raw": true}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Register(plain): %v", err)
+	}
+
+	p := &scriptedProvider{responses: []llm.Response{
+		{ToolCalls: []llm.ToolCall{
+			{ID: "c1", Name: "search", Arguments: `{}`},
+			{ID: "c2", Name: "plain", Arguments: `{}`},
+		}},
+		{Text: "done"},
+	}}
+	a, dir := newAgent(t, p, registry)
+	if _, err := a.RunTurn(context.Background(), "go"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	p.mu.Lock()
+	second := p.calls[1]
+	p.mu.Unlock()
+	toolText := map[string]string{}
+	for _, m := range second.Messages {
+		if m.Role == llm.RoleTool {
+			toolText[m.ToolCallID] = m.Text
+		}
+	}
+	if got := toolText["c1"]; got != rendered {
+		t.Fatalf("rendered tool text = %q, want %q", got, rendered)
+	}
+	if strings.Contains(toolText["c1"], `"sources"`) {
+		t.Fatalf("the model still received the structured JSON: %q", toolText["c1"])
+	}
+	// A tool without a hook keeps the historical JSON encoding.
+	if got := toolText["c2"]; got != `{"raw":true}` {
+		t.Fatalf("JSON tool text = %q", got)
+	}
+
+	// The log keeps the structured value the tool returned, not the render.
+	events, err := session.ReadLog(dir)
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	var sawSearch struct{ Output json.RawMessage }
+	for _, e := range events {
+		if e.Type != "tool/result" {
+			continue
+		}
+		var data struct {
+			CallID string          `json:"callId"`
+			Output json.RawMessage `json:"output"`
+		}
+		if err := json.Unmarshal(e.Data, &data); err != nil {
+			t.Fatalf("tool/result at seq %d: %v", e.Seq, err)
+		}
+		if data.CallID == "c1" {
+			sawSearch.Output = data.Output
+		}
+	}
+	if len(sawSearch.Output) == 0 {
+		t.Fatal("the search tool result was not logged")
+	}
+	var output map[string]any
+	if err := json.Unmarshal(sawSearch.Output, &output); err != nil {
+		t.Fatalf("logged output is not structured JSON: %v (%s)", err, sawSearch.Output)
+	}
+	if _, ok := output["sources"]; !ok {
+		t.Fatalf("logged output lost its structure: %s", sawSearch.Output)
+	}
+}
+
 // TestToolFailureBecomesAResult pins that a failing tool does not abort the
 // turn: the error is reported to the model, which is how it learns the call
 // failed.
@@ -200,6 +302,72 @@ func TestToolFailureBecomesAResult(t *testing.T) {
 	}
 	if !sawError {
 		t.Fatal("the tool error was not recorded in the log")
+	}
+}
+
+// TestToolRenderIsNotUsedForErrors pins that a failed call keeps the plain
+// error text even when the tool has a Render hook: rendering a partial value
+// would hide from the model that the call failed.
+func TestToolRenderIsNotUsedForErrors(t *testing.T) {
+	registry := tools.NewRegistry()
+	if err := registry.Register(tools.Tool{
+		Name:       "boom",
+		Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return map[string]any{"partial": true}, errors.New("exploded")
+		},
+		Render: func(any) string {
+			t.Error("Render was called for a failed call")
+			return "rendered"
+		},
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	p := &scriptedProvider{responses: []llm.Response{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "boom", Arguments: `{}`}}},
+		{Text: "recovered"},
+	}}
+	a, _ := newAgent(t, p, registry)
+	if _, err := a.RunTurn(context.Background(), "go"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	p.mu.Lock()
+	second := p.calls[1]
+	p.mu.Unlock()
+	var text string
+	for _, m := range second.Messages {
+		if m.Role == llm.RoleTool && m.ToolCallID == "c1" {
+			text = m.Text
+		}
+	}
+	if text != "error: exploded" {
+		t.Fatalf("tool text = %q, want the error text", text)
+	}
+}
+
+// TestToolResultText pins the three text paths: a hook replaces JSON encoding,
+// no hook falls back to JSON, an error wins over both, and a value that cannot
+// be marshalled falls back to %v rather than an empty result.
+func TestToolResultText(t *testing.T) {
+	render := func(any) string { return "rendered" }
+	cases := []struct {
+		name     string
+		out      any
+		err      error
+		renderFn func(any) string
+		want     string
+	}{
+		{name: "render hook", out: map[string]any{"a": 1}, renderFn: render, want: "rendered"},
+		{name: "json fallback", out: map[string]any{"a": 1}, want: `{"a":1}`},
+		{name: "error wins over render", out: map[string]any{"a": 1}, err: errors.New("boom"), renderFn: render, want: "error: boom"},
+		{name: "unmarshalable value", out: math.NaN(), want: "NaN"},
+	}
+	for _, tc := range cases {
+		if got := toolResultText(tc.out, tc.err, tc.renderFn); got != tc.want {
+			t.Errorf("%s: text = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -439,4 +607,236 @@ func indexOf(haystack []string, needle string) int {
 		}
 	}
 	return -1
+}
+
+type streamingProvider struct {
+	chunks  []llm.StreamChunk
+	streams [][]llm.StreamChunk
+	called  bool
+	index   int
+}
+
+func (p *streamingProvider) Complete(context.Context, llm.Request) (llm.Response, error) {
+	return llm.Response{}, errors.New("Complete should not be called for a streaming provider")
+}
+
+func (p *streamingProvider) Stream(_ context.Context, _ llm.Request, yield func(llm.StreamChunk) error) error {
+	p.called = true
+	chunks := p.chunks
+	if p.streams != nil {
+		if p.index >= len(p.streams) {
+			return errors.New("streaming provider exhausted")
+		}
+		chunks = p.streams[p.index]
+		p.index++
+	}
+	for _, chunk := range chunks {
+		if err := yield(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestTurnConsumesStreamingProvider(t *testing.T) {
+	p := &streamingProvider{chunks: []llm.StreamChunk{
+		{TextDelta: "hel"},
+		{TextDelta: "lo"},
+	}}
+	a, _ := newAgent(t, p, nil)
+	res, err := a.RunTurn(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if !p.called {
+		t.Fatal("Stream was not called")
+	}
+	if res.Reason != StopCompleted || res.Text != "hello" {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestTurnAssemblesStreamingToolCall(t *testing.T) {
+	registry := tools.NewRegistry()
+	ran := false
+	if err := registry.Register(tools.Tool{
+		Name: "echo", Parameters: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`),
+		Run: func(_ context.Context, args json.RawMessage) (any, error) {
+			ran = true
+			var input struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(args, &input); err != nil {
+				return nil, err
+			}
+			return input.Text, nil
+		},
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	p := &streamingProvider{streams: [][]llm.StreamChunk{
+		{
+			{ToolCallDelta: &llm.ToolCallDelta{Index: 0, ID: "c1", Name: "echo", ArgumentsDelta: `{"text":"`}},
+			{ToolCallDelta: &llm.ToolCallDelta{Index: 0, ArgumentsDelta: `hi"}`}},
+		},
+		{{TextDelta: "done"}},
+	}}
+	a, _ := newAgent(t, p, registry)
+	res, err := a.RunTurn(context.Background(), "use echo")
+	if err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if !ran {
+		t.Fatal("streamed tool call did not execute")
+	}
+	if res.Reason != StopCompleted || res.Text != "done" {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// TestLoggedToolTextIsAuthoritativeOnReplay pins the durable record: the text
+// the model saw is stored on the event, so replay must use it rather than
+// recompute a Render whose result depends on the current tool configuration.
+// The lookup deliberately returns a different projection to prove it is not the
+// one being used.
+func TestLoggedToolTextIsAuthoritativeOnReplay(t *testing.T) {
+	registry := tools.NewRegistry()
+	tool := tools.Tool{
+		Name:        "value",
+		Description: "returns a value",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return map[string]any{"n": 1}, nil
+		},
+		Render: func(any) string { return "rendered at run time" },
+	}
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	p := &scriptedProvider{responses: []llm.Response{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "value", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	a, dir := newAgent(t, p, registry)
+	if _, err := a.RunTurn(context.Background(), "go"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	live := a.History()
+
+	log, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer log.Close()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	drifted := RenderLookup(func(string) func(any) string {
+		return func(any) string { return "rendered NOW" }
+	})
+	rebuilt, err := RebuildHistory(events, drifted)
+	if err != nil {
+		t.Fatalf("RebuildHistory: %v", err)
+	}
+	if len(rebuilt) != len(live) {
+		t.Fatalf("rebuilt %d messages, live %d", len(rebuilt), len(live))
+	}
+	for i := range live {
+		if !reflect.DeepEqual(rebuilt[i], live[i]) {
+			t.Fatalf("message %d differs:\nlive %+v\nrebuilt %+v", i, live[i], rebuilt[i])
+		}
+	}
+}
+
+// TestUnencodableToolOutputKeepsTheEvent pins the log's durability: a value the
+// JSON encoder rejects must not drop the tool/result event or make the logged
+// text disagree with the live history.
+func TestUnencodableToolOutputKeepsTheEvent(t *testing.T) {
+	registry := tools.NewRegistry()
+	tool := tools.Tool{
+		Name:        "nan",
+		Description: "returns NaN",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return math.NaN(), nil
+		},
+	}
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	p := &scriptedProvider{responses: []llm.Response{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "nan", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	a, dir := newAgent(t, p, registry)
+	if _, err := a.RunTurn(context.Background(), "go"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	live := a.History()
+
+	log, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer log.Close()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	rebuilt, err := RebuildHistory(events, nil)
+	if err != nil {
+		t.Fatalf("RebuildHistory: %v", err)
+	}
+	for i := range live {
+		if !reflect.DeepEqual(rebuilt[i], live[i]) {
+			t.Fatalf("message %d differs:\nlive %+v\nrebuilt %+v", i, live[i], rebuilt[i])
+		}
+	}
+}
+
+// TestEmptyErrorTextIsLogged pins that a failed call with an empty message is
+// recorded as a failure and replayed as one: the live history stores
+// "error: ", so the log stores that same text.
+func TestEmptyErrorTextIsLogged(t *testing.T) {
+	registry := tools.NewRegistry()
+	tool := tools.Tool{
+		Name:        "fail",
+		Description: "fails silently",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		Run: func(context.Context, json.RawMessage) (any, error) {
+			return nil, errors.New("")
+		},
+	}
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	p := &scriptedProvider{responses: []llm.Response{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "fail", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	a, dir := newAgent(t, p, registry)
+	if _, err := a.RunTurn(context.Background(), "go"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	live := a.History()
+
+	log, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer log.Close()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	rebuilt, err := RebuildHistory(events, nil)
+	if err != nil {
+		t.Fatalf("RebuildHistory: %v", err)
+	}
+	for i := range live {
+		if !reflect.DeepEqual(rebuilt[i], live[i]) {
+			t.Fatalf("message %d differs:\nlive %+v\nrebuilt %+v", i, live[i], rebuilt[i])
+		}
+	}
 }

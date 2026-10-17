@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/qiyuan2403/Q_RP_dsh/llm"
@@ -207,8 +208,19 @@ func (a *Agent) drive(ctx context.Context) TurnResult {
 				return TurnResult{Reason: StopModelError, Steps: step + 1, Err: err}
 			}
 
-			out, callErr := a.runTool(ctx, call)
-			resultData := map[string]any{"callId": call.ID, "name": call.Name, "output": out}
+			tool, out, callErr := a.runTool(ctx, call)
+			text := toolResultText(out, callErr, tool.Render)
+			// The model-visible text is logged WITH the structured output, as the
+			// official harness does. Replay cannot always re-derive it: Render
+			// depends on the registration's current configuration and the tool
+			// version, and the log is supposed to be the durable record of what
+			// the model saw, not a recipe for recomputing it.
+			resultData := map[string]any{
+				"callId": call.ID,
+				"name":   call.Name,
+				"output": safeJSONValue(out),
+				"text":   text,
+			}
 			if callErr != nil {
 				resultData["error"] = callErr.Error()
 			}
@@ -221,7 +233,7 @@ func (a *Agent) drive(ctx context.Context) TurnResult {
 			a.history = append(a.history, llm.Message{
 				Role:       llm.RoleTool,
 				ToolCallID: call.ID,
-				Text:       toolResultText(out, callErr),
+				Text:       text,
 			})
 		}
 
@@ -244,26 +256,74 @@ func (a *Agent) callModel(ctx context.Context) (llm.Response, error) {
 	if a.cfg.Registry != nil {
 		req.Tools = a.cfg.Registry.Specs()
 	}
+	if streamed, ok := a.cfg.Provider.(llm.StreamProvider); ok {
+		return streamResponse(ctx, streamed, req)
+	}
 	return a.cfg.Provider.Complete(ctx, req)
 }
 
-// runTool dispatches one tool call.
+func streamResponse(ctx context.Context, provider llm.StreamProvider, req llm.Request) (llm.Response, error) {
+	var text strings.Builder
+	toolCalls := make([]llm.ToolCall, 0)
+	var usage llm.Usage
+	err := provider.Stream(ctx, req, func(chunk llm.StreamChunk) error {
+		text.WriteString(chunk.TextDelta)
+		if chunk.Usage != nil {
+			usage = *chunk.Usage
+		}
+		if chunk.ToolCallDelta == nil {
+			return nil
+		}
+		delta := chunk.ToolCallDelta
+		if delta.Index < 0 {
+			return fmt.Errorf("agent: stream returned negative tool-call index %d", delta.Index)
+		}
+		for len(toolCalls) <= delta.Index {
+			toolCalls = append(toolCalls, llm.ToolCall{})
+		}
+		call := &toolCalls[delta.Index]
+		if delta.ID != "" {
+			call.ID = delta.ID
+		}
+		if delta.Name != "" {
+			call.Name = delta.Name
+		}
+		call.Arguments += delta.ArgumentsDelta
+		return nil
+	})
+	if err != nil {
+		return llm.Response{}, err
+	}
+	for i := range toolCalls {
+		if strings.TrimSpace(toolCalls[i].Arguments) == "" {
+			toolCalls[i].Arguments = "{}"
+		}
+	}
+	return llm.Response{Text: text.String(), ToolCalls: toolCalls, Usage: usage}, nil
+}
+
+// runTool dispatches one tool call and returns the resolved definition.
 //
 // A tool error is returned rather than swallowed: it becomes the tool result
-// the model sees, which is how the model learns the call failed.
-func (a *Agent) runTool(ctx context.Context, call llm.ToolCall) (any, error) {
+// the model sees, which is how the model learns the call failed. The definition
+// travels back with the result because the caller needs its Render hook: the
+// log keeps the structured value, the model gets its rendered form. A
+// definition resolved here is also the one whose schema validated the
+// arguments, so the caller cannot render with a tool the call did not use.
+func (a *Agent) runTool(ctx context.Context, call llm.ToolCall) (tools.Tool, any, error) {
 	if a.cfg.Registry == nil {
-		return nil, fmt.Errorf("agent: no tools registered")
+		return tools.Tool{}, nil, fmt.Errorf("agent: no tools registered")
 	}
 	tool, ok := a.cfg.Registry.Lookup(call.Name)
 	if !ok {
-		return nil, fmt.Errorf("agent: unknown tool %q", call.Name)
+		return tools.Tool{}, nil, fmt.Errorf("agent: unknown tool %q", call.Name)
 	}
 	args := json.RawMessage(call.Arguments)
 	if err := tools.Validate(tool, args); err != nil {
-		return nil, err
+		return tool, nil, err
 	}
-	return tool.Run(ctx, args)
+	out, err := tool.Run(ctx, args)
+	return tool, out, err
 }
 
 // History returns the model-visible messages, for inspection and tests.
@@ -273,9 +333,19 @@ func (a *Agent) History() []llm.Message {
 	return append([]llm.Message(nil), a.history...)
 }
 
-func toolResultText(out any, err error) string {
+// toolResultText is the text the model sees for one tool call.
+//
+// render is the tool's optional Render hook. It applies only to a successful
+// result: an error keeps the plain "error: <msg>" shape, because that is what a
+// resumed session reconstructs from the log as well, and rendering a partial
+// value after a failure would hide that the call failed. A nil render keeps the
+// historical JSON encoding.
+func toolResultText(out any, err error, render func(any) string) string {
 	if err != nil {
 		return fmt.Sprintf("error: %v", err)
+	}
+	if render != nil {
+		return render(out)
 	}
 	raw, mErr := json.Marshal(out)
 	if mErr != nil {
@@ -294,6 +364,25 @@ func toolCallsJSON(calls []llm.ToolCall) []map[string]any {
 		})
 	}
 	return out
+}
+
+// safeJSONValue encodes a tool result for the session log without failing.
+//
+// A value the JSON encoder rejects (NaN, a function, a channel) must not lose
+// the whole tool/result event: that would erase the call from the durable
+// record and leave replay with a shorter conversation than the model had.
+// Unencodable values are stored as their printed string, which keeps the event
+// JSON-valid and keeps the logged model text alongside it authoritative.
+func safeJSONValue(v any) json.RawMessage {
+	raw, err := json.Marshal(v)
+	if err == nil {
+		return raw
+	}
+	fallback, fallbackErr := json.Marshal(fmt.Sprint(v))
+	if fallbackErr == nil {
+		return fallback
+	}
+	return json.RawMessage("null")
 }
 
 func mustJSON(v any) json.RawMessage {

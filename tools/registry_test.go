@@ -148,3 +148,45 @@ func TestValidateIgnoresUnknownSchemaKeywords(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 }
+
+// TestRenderIsOptionalAndInertToTheRegistry pins that the render hook is
+// carried as plain struct data: it is not required, it survives Lookup
+// unchanged, and it has no say in validation. The hook is presentation, so a
+// registry rule that consulted it would couple argument checking to formatting.
+func TestRenderIsOptionalAndInertToTheRegistry(t *testing.T) {
+	r := NewRegistry()
+	render := func(any) string { return "rendered" }
+	params := json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`)
+	if err := r.Register(Tool{Name: "with-render", Parameters: params, Run: noop, Render: render}); err != nil {
+		t.Fatalf("Register with a Render hook: %v", err)
+	}
+	if err := r.Register(Tool{Name: "without-render", Run: noop}); err != nil {
+		t.Fatalf("Register without a Render hook: %v", err)
+	}
+
+	tool, ok := r.Lookup("with-render")
+	if !ok {
+		t.Fatal("Lookup(with-render) failed")
+	}
+	if tool.Render == nil || tool.Render(nil) != "rendered" {
+		t.Fatal("Lookup lost the Render hook")
+	}
+	if err := Validate(tool, json.RawMessage(`{"text":"hi"}`)); err != nil {
+		t.Fatalf("Validate with a Render hook: %v", err)
+	}
+	if err := Validate(tool, json.RawMessage(`{}`)); !errors.Is(err, ErrInvalidArgs) {
+		t.Fatalf("Validate with a Render hook: error = %v, want ErrInvalidArgs", err)
+	}
+
+	plain, ok := r.Lookup("without-render")
+	if !ok {
+		t.Fatal("Lookup(without-render) failed")
+	}
+	// The optional field's zero value is nil, and that is a valid tool.
+	if plain.Render != nil {
+		t.Fatal("Render is non-nil for a tool registered without one")
+	}
+	if got := r.Names(); len(got) != 2 || got[0] != "with-render" || got[1] != "without-render" {
+		t.Fatalf("Names = %v", got)
+	}
+}

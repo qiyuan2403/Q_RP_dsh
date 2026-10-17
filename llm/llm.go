@@ -1,9 +1,7 @@
-// Package llm defines the model-provider seam.
+// Package llm defines the model-provider contract.
 //
-// The interface is deliberately small: one call that returns a reply, or an
-// error. Streaming is a provider detail the loop does not need — the loop's
-// unit of work is a complete assistant turn, because that is the unit the
-// session log records.
+// Providers may expose incremental output through StreamProvider while keeping
+// Provider for callers that need one completed response.
 package llm
 
 import (
@@ -84,4 +82,29 @@ type Usage struct {
 // Provider performs model calls.
 type Provider interface {
 	Complete(ctx context.Context, req Request) (Response, error)
+}
+
+// StreamChunk is one provider-neutral incremental response fragment.
+type StreamChunk struct {
+	// TextDelta appends visible assistant text.
+	TextDelta string
+	// ToolCallDelta identifies one tool-call fragment. ArgumentsDelta is
+	// concatenated in order; ID and Name may be supplied only on its first part.
+	ToolCallDelta *ToolCallDelta
+	// Usage is emitted by providers that report final token accounting.
+	Usage *Usage
+}
+
+// ToolCallDelta is a partial function call emitted by a streaming provider.
+type ToolCallDelta struct {
+	Index          int
+	ID             string
+	Name           string
+	ArgumentsDelta string
+}
+
+// StreamProvider performs a model call and reports ordered response fragments.
+// The callback runs synchronously on the provider's calling goroutine.
+type StreamProvider interface {
+	Stream(ctx context.Context, req Request, yield func(StreamChunk) error) error
 }

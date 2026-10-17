@@ -8,6 +8,14 @@ import (
 	"github.com/qiyuan2403/Q_RP_dsh/session"
 )
 
+// RenderLookup resolves a tool's model-facing projection by tool name.
+//
+// Rebuilding history must apply the SAME projection the live loop applied,
+// otherwise a resumed session shows the model a different conversation than
+// the one the log records. A nil return means the tool is unknown here, and
+// the caller falls back to the log's raw JSON.
+type RenderLookup func(toolName string) func(value any) string
+
 // RebuildHistory derives the model-visible message list from a session log's
 // events.
 //
@@ -21,7 +29,16 @@ import (
 // Events that carry no model-visible content (step/start, turn/end, and the
 // rest) are skipped: the log is an audit trail, and only the surface events
 // contribute messages.
-func RebuildHistory(events []session.Event) ([]llm.Message, error) {
+//
+// render resolves the tool's Render hook by name. The live loop renders a tool
+// result before putting it in history, and the log only keeps the structured
+// value, so reconstruction must apply the same projection. Without it a
+// resumed session shows the model JSON where the live one showed rendered
+// text. It is a lookup rather than the registry itself so a caller holding
+// only a log can rebuild without mounting every tool; nil means "no tool is
+// known", which falls back to the raw JSON, as does a lookup miss or a value
+// the log cannot decode.
+func RebuildHistory(events []session.Event, render RenderLookup) ([]llm.Message, error) {
 	var out []llm.Message
 	for _, e := range events {
 		switch e.Type {
@@ -61,18 +78,43 @@ func RebuildHistory(events []session.Event) ([]llm.Message, error) {
 				CallID string          `json:"callId"`
 				Name   string          `json:"name"`
 				Output json.RawMessage `json:"output"`
-				Error  string          `json:"error"`
+				// Text is the model-visible text the live loop logged. It is
+				// authoritative when present: replay shows exactly what the model
+				// saw instead of recomputing a projection that depends on the
+				// current tool configuration and version.
+				Text *string `json:"text"`
+				// Error's presence marks a failed call; a pointer, because an
+				// empty message is still a failure and the live loop branches on
+				// err != nil, not on the message.
+				Error *string `json:"error"`
 			}
 			if err := json.Unmarshal(e.Data, &data); err != nil {
 				return nil, fmt.Errorf("agent: tool/result at seq %d: %w", e.Seq, err)
 			}
-			// Mirror toolResultText exactly: an error becomes its message, and
-			// an output is the JSON the tool returned.
+			// Prefer the logged text. The legacy path exists for logs written
+			// before the text field: mirror toolResultText there too (an error
+			// becomes its message and never consults Render; a successful output
+			// goes through the same Render the live loop used; anything else keeps
+			// the raw logged JSON so a missing or unusable hook cannot make a
+			// resume fail).
 			text := ""
-			if data.Error != "" {
-				text = "error: " + data.Error
-			} else {
+			switch {
+			case data.Text != nil:
+				text = *data.Text
+			case data.Error != nil:
+				text = "error: " + *data.Error
+			default:
 				text = string(data.Output)
+				var hook func(value any) string
+				if render != nil {
+					hook = render(data.Name)
+				}
+				if hook != nil {
+					var value any
+					if err := json.Unmarshal(data.Output, &value); err == nil {
+						text = hook(value)
+					}
+				}
 			}
 			out = append(out, llm.Message{
 				Role:       llm.RoleTool,
